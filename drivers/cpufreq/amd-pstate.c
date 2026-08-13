@@ -1940,10 +1940,19 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
 		cpudata->current_profile = PLATFORM_PROFILE_BALANCED;
 	}
 
+	/*
+	 * Pick the preference that matches how the machine is actually
+	 * powered.  Writing epp_default_dc unconditionally left every
+	 * mains-powered system - every desktop, and every laptop that boots
+	 * on the charger - running the on-battery energy preference until
+	 * something else happened to rewrite EPP.  On a machine with no
+	 * power supply class device at all, power_supply_is_system_supplied()
+	 * reports mains, which is the right answer for a desktop.
+	 */
 	if (dynamic_epp)
 		ret = amd_pstate_set_dynamic_epp(policy);
 	else
-		ret = amd_pstate_set_epp(policy, cpudata->epp_default_dc);
+		ret = amd_pstate_set_epp(policy, amd_pstate_get_balanced_epp(policy));
 	if (ret)
 		goto free_cpudata1;
 
