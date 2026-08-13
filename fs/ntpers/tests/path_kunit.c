@@ -493,17 +493,23 @@ static void test_reserved_device_names(struct kunit *test)
 	};
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(reserved); i++)
-		KUNIT_EXPECT_TRUE_MSG(test,
-			nt_name_is_reserved_device(reserved[i],
-						   strlen(reserved[i])),
-			"\"%s\" should be a device", reserved[i]);
+	for (i = 0; i < ARRAY_SIZE(reserved); i++) {
+		const char *name = reserved[i];
 
-	for (i = 0; i < ARRAY_SIZE(ordinary); i++)
+		KUNIT_EXPECT_TRUE_MSG(test,
+				      nt_name_is_reserved_device(name,
+								 strlen(name)),
+				      "\"%s\" should be a device", name);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(ordinary); i++) {
+		const char *name = ordinary[i];
+
 		KUNIT_EXPECT_FALSE_MSG(test,
-			nt_name_is_reserved_device(ordinary[i],
-						   strlen(ordinary[i])),
-			"\"%s\" should not be a device", ordinary[i]);
+				       nt_name_is_reserved_device(name,
+								  strlen(name)),
+				       "\"%s\" should not be a device", name);
+	}
 }
 
 /*

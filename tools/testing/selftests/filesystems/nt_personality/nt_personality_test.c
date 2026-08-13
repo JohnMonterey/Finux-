@@ -521,7 +521,7 @@ TEST_F(nt_volume, case_insensitive_lookup_preserves_case)
 	ASSERT_EQ(0, make_file(self->dir, "TestFile.txt"));
 	snprintf(expect, sizeof(expect), "%s/TestFile.txt", self->dir);
 
-	for (i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(spellings); i++) {
 		ASSERT_EQ(0, nt_query("resolve", spellings[i], self->reply,
 				      sizeof(self->reply)));
 		EXPECT_EQ(NULL, strstr(self->reply, "error"))
@@ -616,7 +616,7 @@ TEST_F(nt_volume, resolve_nt_object_path)
 	ASSERT_NE(NULL, p);
 	p = strstr(p, "nt=");
 	ASSERT_NE(NULL, p);
-	sscanf(p + 3, "%63s", devname);
+	ASSERT_EQ(1, sscanf(p + 3, "%63s", devname));
 	ASSERT_NE('\0', devname[0]);
 
 	/* The same volume must be reachable without any drive letter. */

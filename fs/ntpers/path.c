@@ -661,9 +661,9 @@ done:
 		if (out->nr_components) {
 			char *slash = nt_last_slash(out->rel, out->rel_len);
 			const char *last = slash ? slash + 1 : out->rel;
+			size_t last_len = out->rel + out->rel_len - last;
 
-			if (nt_name_is_reserved_device(last,
-					out->rel + out->rel_len - last))
+			if (nt_name_is_reserved_device(last, last_len))
 				out->flags |= NT_PARSE_RESERVED_NAME;
 		}
 
