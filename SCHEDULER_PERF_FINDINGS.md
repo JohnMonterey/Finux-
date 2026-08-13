@@ -7,6 +7,43 @@ This is the read-the-source pass that precedes measurement. Every row was
 checked against this checkout, not against memory or folklore; the
 `file:line` column is where you can go and disagree with me.
 
+## What is already fixed
+
+Rows marked **FIXED** below need nothing from you — the change is in the
+tree and applies to any kernel built from it. Four are code changes, two
+are Kconfig defaults:
+
+| | Change | Commit effect |
+| --- | --- | --- |
+| E1 | `check_mm()` reads the folded RSS total and only takes the exact per-CPU sum when that is non-zero, or under `CONFIG_DEBUG_VM` | Removes ~48 remote reads under a raw spinlock from every process exit |
+| E2 | `sched_info` min/max tracking is behind `delayacct_key` | Removes `ktime_get_real_ts64()` from the switch path until userspace turns delay accounting on. Verified: with `CONFIG_TASK_DELAY_ACCT=n` the symbol is gone from `kernel/sched/core.o` entirely; with it on, the call sits behind a patched nop |
+| B4 | `mm_alloc_sched()` skips the per-CPU allocation when the hardware has one last-level cache | Removes an `alloc_percpu()` and a `for_each_possible_cpu()` loop from every fork and exec on single-LLC machines |
+| A2 | amd-pstate applies the AC energy preference on mains power at init instead of always writing the battery one | Desktops stop booting into the on-battery EPP |
+| B1 | `MITIGATION_CALL_DEPTH_TRACKING` now defaults to n | See the measured text-size difference in the B1 row |
+| B2 | `X86_DEBUG_FPU` now defaults to n | Was `default y` for anyone with `DEBUG_KERNEL` set |
+
+**Kconfig default changes only reach configurations generated from
+scratch.** An existing `.config` keeps whatever it already says for every
+symbol it mentions, so a Fedora config will not pick B1 or B2 up on its
+own. That is what the config fragments are for:
+
+```sh
+make finux-performance.config     # no functional loss
+make finux-desktop.config         # trades features - read it first
+```
+
+or, to apply and verify them against a distribution config:
+
+```sh
+tools/testing/finux-perf/optimize-config.sh --desktop /boot/config-$(uname -r)
+```
+
+The script checks that each option actually took the value it was given
+(Kconfig silently re-selects), refuses to write anything if a mitigation,
+32-bit support, cgroups, PSI, KVM, perf, SELinux or module signing moved,
+and detects whether your machine really is single-LLC before letting the
+desktop fragment turn `SCHED_CACHE` off.
+
 ## Read this before the tables
 
 **Nothing here has been benchmarked.** This container is not the target
@@ -15,6 +52,9 @@ reading tells you where the work *is*; it cannot tell you whether removing
 it is measurable on your desktop. Several rows below will turn out to be
 noise. That is the expected outcome for most of them, and
 `tools/testing/finux-perf/analyze.py` is deliberately built to say so.
+The fixes above are justified by what the code does, not by a measurement
+on your hardware — they remove work that provably has no reader, which is
+a different and weaker claim than "this makes your machine faster."
 
 **The Fedora baseline config has still not been captured.** For most
 config rows the question "is this even on?" is currently unanswered. Run
@@ -44,7 +84,7 @@ after being baked into a config.
 | ID | Finding | Where | Effect | Action | Risk | Reversible |
 | --- | --- | --- | --- | --- | --- | --- |
 | **A1** | Once `auditd` has run, **every** `fork()` allocates an audit context and sets `SYSCALL_AUDIT` on the child — permanently, for every syscall that task makes | `kernel/auditsc.c:1057` (`audit_alloc`), guard at `:1063` | **High** for Wine/Proton | Boot with `audit=0`, mask `auditd` | Loses audit records; SELinux denials fall back to dmesg | Boot |
-| **A2** | amd-pstate writes the **battery** EPP preference on a desktop: init unconditionally applies `epp_default_dc` = `BALANCE_PERFORMANCE` (0x80). `epp_default_ac` = `PERFORMANCE` (0x00) is only ever consulted by the dynamic-EPP path | `drivers/cpufreq/amd-pstate.c:1946`, set at `:1938-1939`, AC path at `:1156-1158` | **High** | `echo performance > /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference` | More power and heat; higher idle clocks | Live |
+| **A2** **FIXED** | amd-pstate wrote the **battery** EPP preference on a desktop: init unconditionally applied `epp_default_dc` = `BALANCE_PERFORMANCE` (0x80). `epp_default_ac` = `PERFORMANCE` (0x00) was only ever consulted by the dynamic-EPP path | `drivers/cpufreq/amd-pstate.c`, init now calls `amd_pstate_get_balanced_epp()` — the helper the dynamic path already used, which reports mains when no power-supply device exists | **High** | Nothing on a Finux kernel. On a stock kernel: `echo performance > /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference` | The fix restores intended behaviour; it does not force `performance` on a laptop running on battery | Live |
 | **A3** | `HRTICK` and `HRTICK_DL` default **true** in this tree (upstream historically defaulted them off) — a per-CPU hrtimer may be armed for the slice end on context switch | `kernel/sched/features.h:69-70`, enabled because `CONFIG_HRTIMER_REARM_DEFERRED` is `def_bool y` at `kernel/time/Kconfig:54-57` | **?** — see §Disagreement | `echo NO_HRTICK > /sys/kernel/debug/sched/features`, measure **both ways** | None | Live |
 | **A4** | Fedora runs the `menu` idle governor because it outranks `teo` by one point. `teo` is generally the better predictor on modern client CPUs | `drivers/cpuidle/governors/menu.c:530` (rating 20) vs `teo.c:566` (rating 19) | **Med** | `cpuidle.governor=teo`, or write `/sys/devices/system/cpu/cpuidle/current_governor` | Different idle-exit latency profile | Live |
 | **A5** | PSI adds a third clock read to the switch path and walks the cgroup ancestry to the root — twice when `prev`/`next` do not share an early common ancestor. A Fedora user-session service sits ~6 levels deep | `kernel/sched/psi.c:934` (`cpu_clock`), `:943` and `:984` (the two `for_each_group` walks) | **Med** | `cgroup_disable=pressure` (surgical) or `psi=0` (whole subsystem) | **Breaks systemd-oomd.** Check `systemctl is-active systemd-oomd` first | Boot |
@@ -63,11 +103,11 @@ which matters because Kconfig silently re-selects.
 
 | ID | Finding | Where | Effect | Action | Risk |
 | --- | --- | --- | --- | --- | --- |
-| **B1** | `MITIGATION_CALL_DEPTH_TRACKING` is `default y` and pulls `CALL_THUNKS` → `CALL_PADDING` → `-fpatchable-function-entry=16,16` across the **whole kernel**. It mitigates an **Intel** SKL RSB-underflow bug, is off unless you pass `retbleed=stuff`, and does nothing on Zen 3 | `arch/x86/Kconfig:2455-2460`; chain at `:2396-2398` → `:2378`; flags at `arch/x86/Makefile:228`. Kernel's own help text at `:2468`: "*increases text size by ~5%… For non affected systems this space is unused*" | **High** — ~5% of text is padding, i.e. I-cache and iTLB density on every path | `CONFIG_MITIGATION_CALL_DEPTH_TRACKING=n`. It has a prompt, so you can disable it directly and keep `CPU_SUP_INTEL=y` | **Not a mitigation removal on this CPU** — inactive on AMD in every configuration. Do not ship this in a generic multi-vendor kernel |
-| **B2** | `X86_DEBUG_FPU` is `default y`. It converts an inline pointer-add into an out-of-line exported call on the context-switch path *and* on every exit-to-user | `arch/x86/Kconfig.debug:200-203` (`depends on DEBUG_KERNEL`, which Fedora sets) | **Med–High** | `CONFIG_X86_DEBUG_FPU=n` | None on a production kernel |
+| **B1** **FIXED for new configs** | `MITIGATION_CALL_DEPTH_TRACKING` was `default y` and pulls `CALL_THUNKS` → `CALL_PADDING` → `-fpatchable-function-entry=16,16` across the **whole kernel**. It mitigates an **Intel** SKL RSB-underflow bug, is off unless you pass `retbleed=stuff`, and does nothing on Zen 3 | `arch/x86/Kconfig`; chain at `:2396-2398` → `:2378`; flags at `arch/x86/Makefile:228` | **High.** Measured here, two `vmlinux` builds differing in this symbol alone: **text +2,106,982 bytes (+7.3%)**, data +1,401,128. The help text's "~5%" understates it. That is I-cache and iTLB coverage on every path in the kernel | Default is now n; an **existing** config needs the fragment or `optimize-config.sh`. The symbol has a prompt, so it turns off directly and `CPU_SUP_INTEL=y` is untouched | **Not a mitigation removal on this CPU** — inactive on AMD in every configuration. `retbleed=stuff` without it warns and falls back to another retbleed mitigation (`bugs.c:1246-1252`), so an Intel SKL box is not silently exposed |
+| **B2** **FIXED for new configs** | `X86_DEBUG_FPU` was `default y`. It converts an inline pointer-add into an out-of-line exported call on the context-switch path *and* on every exit-to-user. Its own help text already said "if unsure, say N" while defaulting to Y | `arch/x86/Kconfig.debug` (`depends on DEBUG_KERNEL`, which Fedora sets) | **Med–High** | Default is now n. An **existing** config keeps its old value — use the fragment or `optimize-config.sh` | None on a production kernel |
 | **B3** | `CONFIG_SCHED_CLASS_EXT` takes a **global raw spinlock on every fork and every exit**, whether or not a BPF scheduler is loaded — the `scoped_guard` sits outside the `scx_init_task_enabled` check | `kernel/sched/ext/ext.c:67` (the lock), `:3869-3871` (fork), `:3930-3934` (exit); also `percpu_up_read(&scx_fork_rwsem)` at `:3876` | **Med** on 12 threads; scales worse than it looks | `CONFIG_SCHED_CLASS_EXT=n` unless you actually run a `sched_ext` scheduler | Lose BPF schedulers (LAVD, bpfland, scx_rusty) — relevant if you were considering them for gaming |
-| **B4** | `CONFIG_SCHED_CACHE` allocates a **per-CPU** struct per `mm` and loops `for_each_possible_cpu` to initialise it on every `fork()`+`exec()` — while the balancer it feeds is fully NOP-patched on a single-LLC machine | `include/linux/mm_types.h:1615-1623` (`alloc_percpu` + init), loop at `kernel/sched/fair.c:1581`; called from `kernel/fork.c:1138`, freed at `:732`/`:1149` | **Med** on fork-heavy | `CONFIG_SCHED_CACHE=n` | None on single-LLC. Would matter on a dual-CCD part |
-| **B5** | `CONFIG_SCHED_INFO` puts `sched_info_arrive`/`sched_info_depart` in the switch path with **no static key** — unlike the rest of schedstats. The min/max bookkeeping runs always; `ktime_get_real_ts64()` fires on each new maximum run-delay | `kernel/sched/stats.h:232` (the only guard), `:251` and `:278` (the wall-clock reads), `:321-333` (`sched_info_switch`) | **Med**, but see risk | **Blocked:** measured empirically that `CONFIG_KVM=m` forces `SCHED_INFO=y` even with `TASK_DELAY_ACCT=n` and `SCHEDSTATS=n` | Unreachable without dropping virtualisation. **Your call, not mine** |
+| **B4** **FIXED** | `CONFIG_SCHED_CACHE` allocated a **per-CPU** struct per `mm` and looped `for_each_possible_cpu` to initialise it on every `fork()`+`exec()` — while the balancer it feeds is fully NOP-patched on a single-LLC machine | `include/linux/mm_types.h` (`mm_alloc_sched_noprof`), `kernel/sched/topology.c` (`sched_cache_supported()`), `kernel/sched/fair.c` (`mm_init_sched` NULL path) | **Med** on fork-heavy | Done: the allocation is skipped when the hardware has one LLC. Keyed on `sched_cache_present`, not `sched_cache_active`, so toggling the sysctl cannot strand an mm without state. `mm_init_sched()` still runs — it has to clear the pointer `dup_mm()` copied from the parent. Every reader already tolerated NULL | None. `CONFIG_SCHED_CACHE=n` is still available in `finux-desktop.config` if you want the code gone entirely |
+| **B5** **FIXED in part** | `CONFIG_SCHED_INFO` puts `sched_info_arrive`/`sched_info_depart` in the switch path with **no static key**, unlike the rest of schedstats. `CONFIG_KVM` force-selects `SCHED_INFO`, so this could not be configured away without dropping virtualisation — re-confirmed here: a build with `TASK_DELAY_ACCT=n` and `SCHEDSTATS=n` still lands `SCHED_INFO=y` | `kernel/sched/stats.h`, now `sched_info_record_extremes()` | **Med** | Done: the min/max half — the part with the wall-clock read — is gated on `delayacct_key`, whose only reader is `__delayacct_add_tsk()`. `run_delay` and `pcount` stay ungated because `/proc/<pid>/schedstat` and KVM steal time read them without warning | None. No ABI change: the gated fields are reported only through taskstats, which needs delay accounting on anyway |
 | **B6** | `CONFIG_LATENCYTOP` embeds `latency_record[32]` in every `task_struct` — 32 × ~120 B ≈ **3.8 KB per task** — and `select`s `SCHEDSTATS`, so it silently defeats any attempt to turn schedstats off | `include/linux/sched.h:1461-1462`; `struct latency_record` at `include/linux/latencytop.h:21-26` | **Med** (slab pressure per task) | `CONFIG_LATENCYTOP=n` | Lose `/proc/latency_stats` |
 | **B7** | `CONFIG_LOCKDEP` embeds `held_locks[48]` — 48 × ~48 B ≈ **2.3 KB per task**, more with `LOCK_STAT` | `include/linux/sched.h:1287,1291`; `struct held_lock` at `include/linux/lockdep_types.h:206-226` | **High if on** | Should already be off in Fedora's production kernel — **verify**, don't assume | None on production |
 | **B8** | `CONFIG_DEBUG_VM` adds a `__read_cr3()` to **every** `switch_mm_irqs_off()`. The comment says as much: "*Only do this check if CONFIG_DEBUG_VM=y because `__read_cr3()` …*" | `arch/x86/mm/tlb.c:805-810` | **Med if on** | Fedora ships it off in production, on in the debug kernel — verify | None on production |
@@ -116,8 +156,8 @@ happens to this config study.
 
 | ID | Defect | Where | Why it matters |
 | --- | --- | --- | --- |
-| **E1** | `check_mm()` runs `percpu_counter_sum()` × `NR_MM_COUNTERS` on **every** `__mmdrop()`, unconditionally — not under `CONFIG_DEBUG_VM`. `percpu_counter_sum()` takes the counter's raw spinlock and loops every online CPU. That is 4 × 12 remote cacheline reads under a raw spinlock **per process exit**, purely to print a warning that never fires | `kernel/fork.c:627-644`, called from `__mmdrop` at `:737` | Every process teardown on the machine. The cheap `percpu_counter_read()` exists and would do for a sanity check |
-| **E2** | `sched_info` has no static key, unlike every other schedstat | `kernel/sched/stats.h:232, 251, 278` | See **B5**. The natural fix is a `static_branch`, which would also unblock B5 without dropping KVM |
+| **E1** **FIXED** | `check_mm()` ran `percpu_counter_sum()` × `NR_MM_COUNTERS` on **every** `__mmdrop()`, unconditionally — not under `CONFIG_DEBUG_VM`. `percpu_counter_sum()` takes the counter's raw spinlock and loops every online CPU. That is 4 × 12 remote cacheline reads under a raw spinlock **per process exit**, purely to print a warning that never fires | `kernel/fork.c`, called from `__mmdrop` | Now reads the folded total first and escalates to the exact sum only when it is non-zero, or always under `CONFIG_DEBUG_VM`. The one case this gives up in a production kernel is a residue small enough to have stayed inside a per-CPU batch while the folded total reads exactly zero; debug kernels still catch it. **Worth sending upstream** |
+| **E2** **FIXED** | `sched_info` has no static key, unlike every other schedstat | `kernel/sched/stats.h` | Done — see **B5**. Only the min/max extremes are gated, because they alone have a single, self-declaring reader |
 | **E3** | `struct rq` puts write-every-context-switch `rq->curr` on the same cacheline as fields `select_idle_cpu()` scans **remotely** across all 12 CPUs | `kernel/sched/sched.h:1144-1161` | Classic false sharing. The comment at `:1140-1143` acknowledges the tension and resolves it the other way |
 | **E4** | `sched_clock_cpu(cpu)` is called and its result discarded | `kernel/sched/core.c:4059` | Intentional (comment: "*Sync clocks across CPUs*"), but it is a clock read on the wakeup fast path |
 | **E5** | `tg->load_avg` is the one genuinely contended cacheline in the scheduler — all 12 CPUs read-modify it | `kernel/sched/fair.c:4812` | Inherent to `FAIR_GROUP_SCHED` + autogroup. Not fixable by configuration without giving up group scheduling |

@@ -3,6 +3,22 @@
 **Status: BLOCKED on target-machine data. No configuration has been shipped
 and no performance claim has been made.**
 
+> **This document has been partly superseded.** It records the
+> configuration study for one specific machine. A later source audit
+> covering the whole scheduling and process-lifetime path is in
+> `SCHEDULER_PERF_FINDINGS.md`, and several findings below have since been
+> fixed in the tree rather than left as configuration advice:
+>
+> - Finding 3 (`SCHED_CACHE` per-fork cost) — the per-CPU allocation is now
+>   skipped on single-LLC hardware.
+> - Finding 8 (`X86_DEBUG_FPU` defaults to `y`) — it defaults to `n` here now.
+> - Finding 1 (KVM forces `SCHED_INFO`) — still true, but the expensive half
+>   of `sched_info` is now behind the delay-accounting static key.
+>
+> Finding 5 also needs re-reading: the newer audit found that HZ=250 is a
+> pessimisation on this hardware for a second, independent reason — both
+> idle governors refuse to stop the tick below `TICK_NSEC`.
+
 Branch: `perf/ryzen5500-scheduler-config`
 Tree: Linux 7.2.0-rc7, HEAD `b4b7ed8e0b`
 Date: 2026-08-13

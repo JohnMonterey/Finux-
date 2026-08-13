@@ -79,16 +79,28 @@ echo
 # the script cannot drift apart.
 VARIANTS=(
 "baseline|unchanged reference|"
+# The expensive part of SCHED_CACHE on a single-LLC machine - a per-CPU
+# allocation and a for_each_possible_cpu() loop on every fork and exec -
+# is now skipped at runtime, so this variant measures what is left: the
+# code itself, and the branches at each balancer entry point.
 "A-schedcache|SCHED_CACHE off (single-LLC target)|SCHED_CACHE=n"
 # LATENCYTOP selects SCHEDSTATS, so it has to go too or SCHEDSTATS=n
 # silently fails.  Note this variant CANNOT reach SCHED_INFO=n while KVM
 # is enabled - see PERFORMANCE_AUDIT.md section 3.1.
 "B-schedstats|unconditional scheduler statistics off|TASK_DELAY_ACCT=n SCHEDSTATS=n LATENCYTOP=n"
-"C-hz250|250Hz tick, lazy preemption|HZ_250=y HZ_1000=n HZ_300=n HZ_100=n NO_HZ_IDLE=y PREEMPT_LAZY=y"
+# Split from the original combined variant.  Reading the idle governors
+# showed HZ=250 is a pessimisation here - both refuse to stop the tick
+# below TICK_NSEC (menu.c:371, teo.c:507), so a lower HZ keeps the tick
+# running through idle periods a 1000Hz kernel sleeps through.  It is kept
+# as a variant only so that conclusion can be tested rather than believed,
+# and PREEMPT_LAZY is measured on its own instead of riding along with it.
+"C-hz250|250Hz tick - EXPECTED TO REGRESS, see SCHEDULER_PERF_FINDINGS.md D1|HZ_250=y HZ_1000=n HZ_300=n HZ_100=n NO_HZ_IDLE=y"
+"C2-preemptlazy|lazy preemption at the current tick rate|PREEMPT_LAZY=y"
 "D-unused|unused scheduler/accounting features off|SCHED_CLASS_EXT=n CGROUP_CPUACCT=n"
-# DEBUG_NET_SMALL_RTNL selects PROVE_LOCKING.  X86_DEBUG_FPU is
-# "default y" and is on in x86_64_defconfig, so it is a live cost rather
-# than a formality.
+# DEBUG_NET_SMALL_RTNL selects PROVE_LOCKING.  X86_DEBUG_FPU now defaults
+# to n in this tree, but a distribution config carries its own value and
+# will still have it on, so it stays in the list - "already n" is a result
+# worth seeing rather than an entry worth deleting.
 "E-nodebug|production diagnostics off|DEBUG_PREEMPT=n DEBUG_VM=n DEBUG_ENTRY=n X86_DEBUG_FPU=n PROVE_LOCKING=n LOCK_STAT=n KASAN=n KCSAN=n KCOV=n DEBUG_KMEMLEAK=n DEBUG_OBJECTS=n DEBUG_NET_SMALL_RTNL=n"
 # X86_AMD_PSTATE, DEFAULT_MODE=3, CPU_IDLE and CPU_SUP_AMD are already
 # forced or already the default on x86_64 (SCHED_MC_PRIO selects the
