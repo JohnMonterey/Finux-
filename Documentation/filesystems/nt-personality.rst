@@ -298,10 +298,15 @@ Known limitations of tier 2, stated plainly:
   stops the walk with ``-ELOOP`` rather than resolving to something the
   caller did not ask for.
 * The first touch of each differently-cased name reads a directory.
+* It needs *read* permission on a directory, not merely search
+  permission, to match a name by a casing other than the stored one.  On
+  a mode 0711 directory a caller can open a file by its exact name but
+  not by a different casing.  This is deliberate: the alternative would
+  let a caller enumerate an unreadable directory one guess at a time.
 
-None of these apply on a tier 1 volume, and none are architectural: they
-are the cost of a filesystem with no case-insensitive index.  Counters for
-the cache are in ``<debugfs>/ntpers/cache``.
+None of these apply on a tier 1 volume, and the first three are not
+architectural: they are the cost of a filesystem with no case-insensitive
+index.  Counters for the cache are in ``<debugfs>/ntpers/cache``.
 
 Performance notes
 =================

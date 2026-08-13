@@ -47,6 +47,16 @@
  * configuration; tier 2 exists so that the personality is usable on a
  * filesystem that was not prepared for it, and it is slower on the first
  * touch of each name.
+ *
+ * One security consequence of tier 2 deserves stating outright.  Matching
+ * a name case-insensitively without an index requires reading the
+ * directory, so it needs read permission on that directory - not merely
+ * search permission.  On a mode 0711 directory, a caller can therefore
+ * open a file by its exact name but not by a different casing.  That is
+ * the correct outcome: allowing otherwise would let a caller enumerate a
+ * directory the owner deliberately made unreadable, one guess at a time.
+ * Tier 1 has no such restriction, because there the filesystem's own
+ * index does the matching.
  */
 
 #include <linux/bits.h>
@@ -399,6 +409,19 @@ static int nt_ci_scan_dir(const struct path *dir, const char *fold,
 	};
 	struct file *file;
 	int err;
+
+	/*
+	 * dentry_open() is a kernel-internal open and does not call
+	 * may_open(), so the read permission that reading a directory
+	 * requires has to be checked here.  Without this, a caller with
+	 * only search permission on a directory could enumerate it one
+	 * folded-name guess at a time - which is precisely the property a
+	 * mode 0711 directory exists to deny.
+	 */
+	err = inode_permission(mnt_idmap(dir->mnt), d_inode(dir->dentry),
+			       MAY_READ);
+	if (err)
+		return err;
 
 	file = dentry_open(dir, O_RDONLY | O_DIRECTORY, current_cred());
 	if (IS_ERR(file))

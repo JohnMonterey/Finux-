@@ -16,6 +16,7 @@
  */
 
 #include <kunit/test.h>
+#include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
@@ -449,6 +450,92 @@ static void test_ci_argument_checking(struct kunit *test)
 	dput(file);
 }
 
+/*
+ * Matching a name by a casing other than the stored one requires reading
+ * the directory, so it requires read permission on it - unlike an exact
+ * lookup, which only needs search permission.  Check that a mode 0711
+ * directory therefore serves the exact name and refuses the folded one,
+ * rather than quietly enumerating a directory the owner made unreadable.
+ *
+ * KUnit runs as root, which bypasses DAC entirely, so the test installs
+ * an unprivileged credential for the duration of the two lookups.  That
+ * is the only way to observe the behaviour it is asserting.
+ */
+static void test_ci_scan_needs_read_permission(struct kunit *test)
+{
+	struct nt_cf_test_ctx *ctx = CTX(test);
+	const struct cred *old_cred;
+	struct dentry *dir, *file;
+	struct path dirpath, found;
+	struct cred *unpriv;
+	struct iattr attr = {
+		.ia_valid = ATTR_MODE,
+		.ia_mode = S_IFDIR | 0311,
+	};
+	int err;
+
+	dir = nt_cf_create(test, ctx->root.dentry, "Locked", true);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(dir));
+
+	file = nt_cf_create(test, dir, "Secret.txt", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+
+	/* Search permission but no read permission: the interesting case. */
+	inode_lock(d_inode(dir));
+	err = notify_change(&nop_mnt_idmap, dir, &attr, NULL);
+	inode_unlock(d_inode(dir));
+	if (err) {
+		dput(file);
+		dput(dir);
+		kunit_skip(test, "could not drop read permission (%d)", err);
+	}
+
+	unpriv = prepare_creds();
+	if (!unpriv) {
+		dput(file);
+		dput(dir);
+		kunit_skip(test, "could not prepare credentials");
+	}
+
+	/*
+	 * Drop every capability that would let the caller ignore the mode,
+	 * and stop being uid 0, which owns the directory we just locked.
+	 */
+	cap_clear(unpriv->cap_effective);
+	cap_clear(unpriv->cap_permitted);
+	cap_clear(unpriv->cap_bset);
+	unpriv->fsuid = make_kuid(unpriv->user_ns, 65534);
+	unpriv->fsgid = make_kgid(unpriv->user_ns, 65534);
+
+	dirpath.mnt = ctx->mnt;
+	dirpath.dentry = dir;
+
+	old_cred = override_creds(unpriv);
+
+	/* The exact name still works: search permission is enough. */
+	err = nt_ci_lookup(&dirpath, "Secret.txt", 10, &found);
+	KUNIT_EXPECT_EQ_MSG(test, err, 0,
+			    "exact lookup needs only search permission");
+	if (!err)
+		path_put(&found);
+
+	/*
+	 * A different casing has to read the directory, and must be
+	 * refused rather than enumerating it one guess at a time.
+	 */
+	err = nt_ci_lookup(&dirpath, "secret.txt", 10, &found);
+	KUNIT_EXPECT_EQ_MSG(test, err, -EACCES,
+			    "folded lookup must not read an unreadable dir");
+	if (!err)
+		path_put(&found);
+
+	revert_creds(old_cred);
+	put_cred(unpriv);
+
+	dput(file);
+	dput(dir);
+}
+
 static struct kunit_case nt_casefold_test_cases[] = {
 	KUNIT_CASE(test_ci_lookup_preserves_case),
 	KUNIT_CASE(test_ci_lookup_is_cached),
@@ -457,6 +544,7 @@ static struct kunit_case nt_casefold_test_cases[] = {
 	KUNIT_CASE(test_ci_lookup_directories),
 	KUNIT_CASE(test_ci_resolve_windows_layout),
 	KUNIT_CASE(test_ci_unicode_names),
+	KUNIT_CASE(test_ci_scan_needs_read_permission),
 	KUNIT_CASE(test_ci_argument_checking),
 	{}
 };
