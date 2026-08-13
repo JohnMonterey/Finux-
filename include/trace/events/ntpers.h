@@ -142,6 +142,81 @@ TRACE_EVENT(ntpath_ci_lookup,
 		  __get_str(name), __get_str(how), __entry->err)
 );
 
+#define nt_show_attrs(attrs)						\
+	__print_flags(attrs, "|",					\
+		{ NT_FILE_ATTRIBUTE_READONLY,	     "READONLY" },	\
+		{ NT_FILE_ATTRIBUTE_HIDDEN,	     "HIDDEN" },	\
+		{ NT_FILE_ATTRIBUTE_SYSTEM,	     "SYSTEM" },	\
+		{ NT_FILE_ATTRIBUTE_DIRECTORY,	     "DIRECTORY" },	\
+		{ NT_FILE_ATTRIBUTE_ARCHIVE,	     "ARCHIVE" },	\
+		{ NT_FILE_ATTRIBUTE_DEVICE,	     "DEVICE" },	\
+		{ NT_FILE_ATTRIBUTE_NORMAL,	     "NORMAL" },	\
+		{ NT_FILE_ATTRIBUTE_TEMPORARY,	     "TEMPORARY" },	\
+		{ NT_FILE_ATTRIBUTE_SPARSE_FILE,     "SPARSE" },	\
+		{ NT_FILE_ATTRIBUTE_REPARSE_POINT,   "REPARSE" },	\
+		{ NT_FILE_ATTRIBUTE_COMPRESSED,	     "COMPRESSED" },	\
+		{ NT_FILE_ATTRIBUTE_OFFLINE,	     "OFFLINE" },	\
+		{ NT_FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, "NO_INDEX" },	\
+		{ NT_FILE_ATTRIBUTE_ENCRYPTED,	     "ENCRYPTED" })
+
+/**
+ * ntmeta_attrs - DOS attributes were read or written
+ * @how: which storage answered - derived, stored, or native NTFS
+ */
+TRACE_EVENT(ntmeta_attrs,
+	TP_PROTO(const char *how, u64 ino, u32 attrs, int err),
+
+	TP_ARGS(how, ino, attrs, err),
+
+	TP_STRUCT__entry(
+		__string(how,	how)
+		__field(u64,	ino)
+		__field(u32,	attrs)
+		__field(int,	err)
+	),
+
+	TP_fast_assign(
+		__assign_str(how);
+		__entry->ino	= ino;
+		__entry->attrs	= attrs;
+		__entry->err	= err;
+	),
+
+	TP_printk("%s DOS attributes inode=%llu attrs=%s err=%d",
+		  __get_str(how), __entry->ino,
+		  nt_show_attrs(__entry->attrs), __entry->err)
+);
+
+/**
+ * ntmeta_query - a full NT file information query was answered
+ *
+ * Records whether CreationTime is real or estimated, which is the part
+ * of the answer most likely to be wrong in a way nobody notices.
+ */
+TRACE_EVENT(ntmeta_query,
+	TP_PROTO(u64 ino, u32 attrs, u32 time_flags),
+
+	TP_ARGS(ino, attrs, time_flags),
+
+	TP_STRUCT__entry(
+		__field(u64,	ino)
+		__field(u32,	attrs)
+		__field(u32,	time_flags)
+	),
+
+	TP_fast_assign(
+		__entry->ino		= ino;
+		__entry->attrs		= attrs;
+		__entry->time_flags	= time_flags;
+	),
+
+	TP_printk("queried inode=%llu attrs=%s creation=%s",
+		  __entry->ino, nt_show_attrs(__entry->attrs),
+		  __print_flags(__entry->time_flags, "|",
+				{ NT_TIME_CREATION_EXACT,     "exact" },
+				{ NT_TIME_CREATION_ESTIMATED, "estimated" }))
+);
+
 /**
  * ntvol_event - a volume appeared, changed letter, or went away
  */

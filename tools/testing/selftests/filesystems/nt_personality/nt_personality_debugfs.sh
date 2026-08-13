@@ -165,6 +165,51 @@ else
 	echo "ok: C: already in use, skipped system volume promotion"
 fi
 
+# NT metadata for a real file on the volume.
+nt_getinfo()
+{
+	local path="$1"
+	exec {fd}<> "$DBG/getinfo" || return 1
+	printf '%s' "$path" >&$fd
+	cat <&$fd
+	exec {fd}>&-
+}
+
+INFO=$(nt_getinfo "$LETTER:\\Windows\\System32\\kernel32.dll")
+printf '%s\n' "$INFO" | grep -q '^ok$' ||
+	fail "getinfo failed: $INFO"
+
+# A regular file must carry ARCHIVE (0x20) and not DIRECTORY (0x10).
+ATTRS=$(printf '%s\n' "$INFO" | sed -n 's/^attributes //p')
+[ $(( ATTRS & 0x20 )) -ne 0 ] || fail "kernel32.dll missing ARCHIVE ($ATTRS)"
+[ $(( ATTRS & 0x10 )) -eq 0 ] || fail "kernel32.dll claims DIRECTORY ($ATTRS)"
+echo "ok: file attributes $ATTRS"
+
+# A directory must carry DIRECTORY.
+DATTRS=$(nt_getinfo "$LETTER:\\Windows" | sed -n 's/^attributes //p')
+[ $(( DATTRS & 0x10 )) -ne 0 ] || fail "C:\\Windows missing DIRECTORY ($DATTRS)"
+echo "ok: directory attributes $DATTRS"
+
+# CreationTime must be in NT units and explicitly labelled real or not.
+CREATION=$(printf '%s\n' "$INFO" | sed -n 's/^creation //p')
+EXACT=$(printf '%s\n' "$INFO" | sed -n 's/^creation_exact //p')
+[ "$CREATION" -gt 116444736000000000 ] ||
+	fail "creation time $CREATION is not an NT timestamp"
+case "$EXACT" in
+0|1) ;;
+*) fail "creation_exact is '$EXACT', expected 0 or 1" ;;
+esac
+echo "ok: creation time $CREATION (exact=$EXACT)"
+
+# File ids must be non-zero and stable.
+FID=$(printf '%s\n' "$INFO" | sed -n 's/^file_id //p')
+[ "$FID" -ne 0 ] || fail "file id is zero"
+FID2=$(nt_getinfo "$LETTER:\\windows\\system32\\KERNEL32.DLL" |
+	sed -n 's/^file_id //p')
+[ "$FID" = "$FID2" ] ||
+	fail "file id differs by path casing: $FID vs $FID2"
+echo "ok: file id $FID stable across casings"
+
 # The parser reports Win32 device names without enforcing them.
 nt_parse 'C:\Users\CON' | grep -q reserved ||
 	fail "CON should be flagged as a Win32 device name"

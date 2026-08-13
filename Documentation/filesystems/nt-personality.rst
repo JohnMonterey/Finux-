@@ -49,8 +49,9 @@ each behaviour is implemented in exactly one of them.
     |                                                                |  namespace.c
     +---------------------------------------------------------------+
     | 3. NT filesystem personality    DOS attributes, NT timestamps, |  fs/ntpers/
-    |                                 security descriptors, streams, |  (stages 3-5)
-    |                                 reparse points, share modes    |
+    |                                 security descriptors, file IDs |  meta.c
+    |                                 streams, reparse points,       |  (streams and
+    |                                 share modes                    |  locks: 4-5)
     +---------------------------------------------------------------+
     | 2. Linux VFS                    dentries, inodes, mounts,      |  fs/
     |                                 struct path, struct file       |
@@ -345,6 +346,7 @@ A development and test interface, root-only, not ABI::
     <debugfs>/ntpers/control       write  mount/unmount/system commands
     <debugfs>/ntpers/parse         rw     write a path, read its parse
     <debugfs>/ntpers/resolve       rw     write a path, read what it resolved to
+    <debugfs>/ntpers/getinfo       rw     write a path, read its NT metadata
     <debugfs>/ntpers/cache         read   fold-hint cache counters
     <debugfs>/ntpers/personality   rw     this process's personality flags
 
@@ -370,6 +372,8 @@ Event                   Reports
 ``ntpath_parse``        input, classification, canonical form, flags
 ``ntpath_resolve``      starting volume, canonical form, resulting dentry
 ``ntpath_ci_lookup``    which case-folding tier answered, and whether it hit
+``ntmeta_attrs``        DOS attributes read or written, and from where
+``ntmeta_query``        a metadata query, and whether CreationTime is real
 ``ntvol_event``         volume created, relettered, destroyed
 ======================  ====================================================
 
@@ -402,48 +406,150 @@ Stage                                          State
 1. Volumes, namespaces, per-process contexts  implemented
 2. NT/Win32 pathname parser and resolver      implemented
 2. Case-insensitive resolution                implemented (both tiers)
-3. DOS attributes, NT timestamps, security    designed; not implemented
+3. DOS attributes, NT timestamps, file IDs    implemented
+3. NT security descriptor storage             implemented (advisory)
 4. Alternate streams, reparse points, 8.3     parsed only; not stored
 5. Share modes, delete-pending, range locks   designed; not implemented
 6. System volume layout (C:\Windows, ...)     volume concept implemented
 7. Win32 subsystem hooks                      partial; see below
 ============================================  =========================
 
-What stages 3 to 5 will need
-============================
+File metadata
+=============
 
-Recorded here so the design is not lost, and so the hooks that already
-exist make sense.
+``meta.c`` answers NT's questions about a file using an inode that was
+never designed to answer them.  Three sources, in order of preference:
+the filesystem itself, the inode, and this subsystem's own extended
+attribute.
 
-Metadata (stage 3)
-------------------
+DOS attributes
+--------------
 
-DOS attributes will be stored in an xattr for filesystems that cannot
-represent them natively, following the names ``fs/ntfs3`` already uses
-(``system.ntfs_attrib``), so that a volume backed by real NTFS and one
-backed by ext4 look the same from above.  ``ntfs3`` remains the reference
-for what the values mean.
+Which source owns which attribute is the whole design:
 
-NT expects four timestamps and Linux provides three.  The mapping is
-*not* the naive one:
+=====================  ==========  ==============================================
+Attribute              Source      Notes
+=====================  ==========  ==============================================
+``DIRECTORY``          inode       ``S_ISDIR``
+``REPARSE_POINT``      inode       ``S_ISLNK`` until stage 4 adds real tags
+``DEVICE``             inode       character, block, fifo or socket
+``COMPRESSED``         statx       ``STATX_ATTR_COMPRESSED``
+``ENCRYPTED``          statx       ``STATX_ATTR_ENCRYPTED``
+``SPARSE_FILE``        statx       fewer blocks than the size accounts for
+``READONLY``           file mode   no write bit set for anybody
+``HIDDEN``             xattr       defaults to "name begins with a dot"
+``ARCHIVE``            xattr       defaults to set, for regular files
+``SYSTEM``             xattr
+``TEMPORARY``          xattr
+``OFFLINE``            xattr
+``NOT_CONTENT_INDEXED`` xattr
+=====================  ==========  ==============================================
+
+Anything derived is recomputed on every query, because every one of those
+can change through an ordinary POSIX operation that has no reason to
+report it.  Storing them would only let them go stale.
+
+``READONLY`` is backed by the file mode rather than stored, so the Linux
+and NT answers to "can this be written?" cannot disagree.  Setting it
+removes write permission from everyone; clearing it restores write
+permission **to the owner only**.  That asymmetry is deliberate: a DOS
+attribute carries no information about who should be able to write, so
+the only safe reconstruction is the least privileged one.  Mirroring the
+read bits instead would turn an ordinary 0644 file into 0666 every time a
+Windows program cleared a read-only flag.
+
+On the xattr namespace, which is a security question rather than a naming
+one:
+
+=============  ==========================================================
+Namespace      Why it is or is not used
+=============  ==========================================================
+``system.``    Reserved for the filesystem; a generic filesystem rejects
+               names it does not implement.  Used only for the ntfs3
+               passthrough, where the values are real NTFS metadata.
+``trusted.``   Requires ``CAP_SYS_ADMIN`` on every access, so an ordinary
+               program could not set the hidden bit on its own file.
+               That is not the semantics Windows has.
+``user.``      Writable by the file's owner, which is exactly right for
+               DOS attributes.  Used for ``user.nt.dos_attrib`` and
+               ``user.nt.crtime``.  Its limitation is that the kernel
+               forbids ``user.*`` on symlinks and device nodes, so DOS
+               attributes on those fall back to derivation.
+``security.``  Mediated by the LSM rather than freely writable.  Used for
+               the security descriptor, and where Samba keeps NT ACLs.
+=============  ==========================================================
+
+On a volume backed by real NTFS, ``system.ntfs_attrib`` and
+``system.ntfs_security`` are tried first, so the values read and written
+are the ones in ``$STANDARD_INFORMATION``.  A volume backed by NTFS and
+one backed by ext4 look identical from above.
+
+Timestamps
+----------
+
+NT expects four timestamps and Linux provides three.  The mapping is not
+the naive one:
 
 ===================  ====================================================
 NT                   Linux
 ===================  ====================================================
 ``LastWriteTime``    ``mtime``
 ``LastAccessTime``   ``atime``
-``ChangeTime``       ``ctime`` - metadata change, the correct match
-``CreationTime``     ``statx`` ``btime`` where the filesystem has it,
-                     otherwise an xattr.  It is **not** ``ctime``.
+``ChangeTime``       ``ctime`` - metadata change time, the correct match
+``CreationTime``     ``statx`` ``btime`` where the filesystem has one,
+                     otherwise a stored value, otherwise an estimate
 ===================  ====================================================
 
-NT timestamps are 100 ns units since 1601; ``fs/ntfs3``'s ``kernel2nt()``
-and ``nt2kernel()`` are the reference conversion.
+``ctime`` is **not** ``CreationTime``.  It is the inode change time, and
+NT already has a concept for that.  When no birth time exists anywhere,
+``nt_query_file_info()`` reports the oldest timestamp the inode does have
+and sets ``NT_TIME_CREATION_ESTIMATED``, so a caller that needs to know
+the difference can tell.  Exactly one of ``NT_TIME_CREATION_EXACT`` and
+``NT_TIME_CREATION_ESTIMATED`` is always set; the KUnit suite asserts
+that.
 
-Security descriptors will be stored alongside Linux credentials rather
-than replacing them, so Linux applications continue to see ordinary
-uid/gid/mode and a future Win32 subsystem can read an owner SID, group
-SID and DACL in their native representation.
+A stored creation time is only consulted when the filesystem has no birth
+time of its own, because the real birth time is always the better answer.
+
+NT time is 100ns units since 1601-01-01;
+``nt_time_from_timespec()``/``nt_time_to_timespec()`` are the conversion,
+matching ``fs/ntfs3``'s ``kernel2nt()``/``nt2kernel()``.
+
+File identifiers
+----------------
+
+The property that matters is that an id must not silently start referring
+to a different file.  An inode number alone does not have that property,
+because inode numbers are reused after deletion - the same problem NFS
+has, with the same answer: pair the inode number with the inode
+generation, which changes on reuse.
+
+The 64-bit id is the inode number, because that is the width NT gives us.
+The 128-bit id carries the inode number, the generation and the volume
+serial, and is the one to prefer.
+
+Security descriptors
+--------------------
+
+Stored alongside the Linux credentials, not instead of them.  Linux uid,
+gid, mode and POSIX ACLs remain the only thing that governs access; the
+descriptor is metadata a future Win32 subsystem can hand back to a caller
+that asks for an owner SID or a DACL.  The header is validated before
+storage, so anything reading one back can trust it.
+
+.. warning::
+   This is why the descriptor is safe in ``security.`` today: it is
+   inert, so a forged one grants nothing.  Before anything starts making
+   access decisions from it, this needs revisiting.  At that point a
+   descriptor an unprivileged owner can rewrite becomes an
+   access-control bypass, and the write path will have to enforce that a
+   new descriptor is no more permissive than the caller could already
+   achieve through ``chmod``.
+
+What stages 4 and 5 will need
+=============================
+
+Recorded here so the design is not lost.
 
 Streams and reparse points (stage 4)
 ------------------------------------

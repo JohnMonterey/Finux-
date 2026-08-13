@@ -269,6 +269,100 @@ struct nt_path {
 /* Caller understands named streams; otherwise a stream request fails. */
 #define NT_RESOLVE_ALLOW_STREAM	BIT(4)
 
+/*
+ * NT timestamps count 100ns intervals since 1601-01-01.  These match
+ * fs/ntfs3's kernel2nt()/nt2kernel(), which are the reference conversion,
+ * and are here so that callers outside a filesystem can use them.
+ */
+#define NT_TIME_UNITS_PER_SEC	10000000LL
+#define NT_TIME_EPOCH_DELTA	11644473600LL	/* 1601-01-01 to 1970-01-01 */
+
+static inline u64 nt_time_from_timespec(const struct timespec64 *ts)
+{
+	return (u64)((ts->tv_sec + NT_TIME_EPOCH_DELTA) * NT_TIME_UNITS_PER_SEC +
+		     ts->tv_nsec / 100);
+}
+
+static inline void nt_time_to_timespec(u64 nt, struct timespec64 *ts)
+{
+	s64 t = (s64)nt - NT_TIME_UNITS_PER_SEC * NT_TIME_EPOCH_DELTA;
+	s32 rem;
+
+	ts->tv_sec = div_s64_rem(t, NT_TIME_UNITS_PER_SEC, &rem);
+	ts->tv_nsec = rem * 100;
+}
+
+/* struct nt_file_info::time_flags */
+/*
+ * CreationTime came from the filesystem's own birth time, or from a value
+ * this subsystem stored earlier.  It means what NT means by it.
+ */
+#define NT_TIME_CREATION_EXACT		BIT(0)
+/*
+ * The backing filesystem has no birth time and none was ever stored, so
+ * CreationTime is a best-effort estimate.  It is *not* the Linux ctime,
+ * which is the inode change time and a different concept entirely; the
+ * estimate is the oldest timestamp the inode does have.  A caller that
+ * needs to know the difference must check this flag.
+ */
+#define NT_TIME_CREATION_ESTIMATED	BIT(1)
+
+/**
+ * struct nt_file_info - what NT wants to know about a file
+ * @attributes:		NT_FILE_ATTRIBUTE_* mask
+ * @reparse_tag:	reparse tag, or 0 when not a reparse point
+ * @creation:		NT CreationTime
+ * @last_access:	NT LastAccessTime (Linux atime)
+ * @last_write:		NT LastWriteTime (Linux mtime)
+ * @change:		NT ChangeTime (Linux ctime - the correct match)
+ * @time_flags:		NT_TIME_* describing how reliable @creation is
+ * @file_id:		64-bit file id, as returned by GetFileInformationByHandle
+ * @file_id_128:	128-bit file id, as in FILE_ID_INFO
+ * @volume_serial:	serial of the volume the file lives on
+ * @size:		end-of-file position
+ * @alloc_size:		space actually allocated
+ * @nlink:		hard link count
+ *
+ * Assembled by nt_query_file_info() from a statx, the inode, and this
+ * subsystem's own stored metadata.
+ */
+struct nt_file_info {
+	u32			attributes;
+	u32			reparse_tag;
+	struct timespec64	creation;
+	struct timespec64	last_access;
+	struct timespec64	last_write;
+	struct timespec64	change;
+	u32			time_flags;
+	u64			file_id;
+	u8			file_id_128[16];
+	u32			volume_serial;
+	u64			size;
+	u64			alloc_size;
+	u32			nlink;
+};
+
+/*
+ * Which attributes come from where.  See fs/ntpers/meta.c and
+ * Documentation/filesystems/nt-personality.rst for the reasoning.
+ */
+/* Derived from the inode every time; storing them would only go stale. */
+#define NT_ATTR_DERIVED							\
+	(NT_FILE_ATTRIBUTE_DIRECTORY | NT_FILE_ATTRIBUTE_REPARSE_POINT | \
+	 NT_FILE_ATTRIBUTE_COMPRESSED | NT_FILE_ATTRIBUTE_ENCRYPTED |	\
+	 NT_FILE_ATTRIBUTE_SPARSE_FILE | NT_FILE_ATTRIBUTE_DEVICE)
+/*
+ * Backed by the file mode rather than by stored metadata, so that the
+ * Linux and NT views of "can I write this?" cannot disagree.
+ */
+#define NT_ATTR_MODE_BACKED	NT_FILE_ATTRIBUTE_READONLY
+/* Kept in an extended attribute; nothing in Linux represents them. */
+#define NT_ATTR_STORED							\
+	(NT_FILE_ATTRIBUTE_HIDDEN | NT_FILE_ATTRIBUTE_SYSTEM |		\
+	 NT_FILE_ATTRIBUTE_ARCHIVE | NT_FILE_ATTRIBUTE_TEMPORARY |	\
+	 NT_FILE_ATTRIBUTE_OFFLINE |					\
+	 NT_FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
+
 #ifdef CONFIG_NT_FS_PERSONALITY
 
 /* --- pathname parser (fs/ntpers/path.c) ------------------------------ */
@@ -342,6 +436,19 @@ int nt_ci_lookup(const struct path *dir, const char *name, size_t len,
 		 struct path *out);
 void nt_ci_invalidate_dir(struct inode *dir);
 void nt_ci_cache_stats(struct seq_file *m);
+
+/* --- file metadata (fs/ntpers/meta.c) -------------------------------- */
+
+int nt_query_file_info(const struct path *path, struct nt_volume *vol,
+		       struct nt_file_info *info);
+int nt_get_file_attributes(const struct path *path, u32 *attrs);
+int nt_set_file_attributes(const struct path *path, u32 attrs);
+int nt_set_creation_time(const struct path *path,
+			 const struct timespec64 *ts);
+ssize_t nt_get_security_descriptor(const struct path *path, void *buf,
+				   size_t size);
+int nt_set_security_descriptor(const struct path *path, const void *buf,
+			       size_t size);
 
 /* --- subsystem init (fs/ntpers/main.c) ------------------------------- */
 

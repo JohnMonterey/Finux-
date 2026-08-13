@@ -2,4 +2,4 @@
 
 obj-$(CONFIG_NT_FS_PERSONALITY_KUNIT_TEST) += ntpers_kunit.o
 
-ntpers_kunit-y := path_kunit.o volume_kunit.o casefold_kunit.o
+ntpers_kunit-y := path_kunit.o volume_kunit.o casefold_kunit.o meta_kunit.o

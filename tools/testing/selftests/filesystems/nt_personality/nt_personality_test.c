@@ -120,6 +120,40 @@ static const char *field(const char *blob, const char *key, char *buf,
 	return NULL;
 }
 
+/*
+ * Join a directory and a name without a format string, so the bound is
+ * checked here rather than guessed at by the compiler.
+ */
+static int join_path(char *out, size_t size, const char *dir,
+		     const char *name)
+{
+	size_t dlen = strlen(dir), nlen = strlen(name);
+
+	if (dlen + 1 + nlen + 1 > size)
+		return -1;
+
+	memcpy(out, dir, dlen);
+	out[dlen] = '/';
+	memcpy(out + dlen + 1, name, nlen);
+	out[dlen + 1 + nlen] = '\0';
+	return 0;
+}
+
+static int make_file(const char *dir, const char *name)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	if (join_path(path, sizeof(path), dir, name))
+		return -1;
+
+	fd = open(path, O_CREAT | O_WRONLY, 0644);
+	if (fd < 0)
+		return -1;
+	close(fd);
+	return 0;
+}
+
 /* ------------------------------------------------------------- prctl */
 
 TEST(personality_set_and_get)
@@ -150,10 +184,24 @@ TEST(personality_set_and_get)
 
 TEST(personality_rejects_unknown_flags)
 {
-	int ret = prctl(PR_SET_NT_PERSONALITY, 0x80000000, 0, 0, 0);
+	unsigned int flags = 0;
+	int ret;
 
+	/*
+	 * An unknown prctl() option also fails with EINVAL, so checking
+	 * the rejection alone would pass on a kernel without the feature
+	 * at all.  Establish that the option exists first.
+	 */
+	if (prctl(PR_SET_NT_PERSONALITY, NT_PERSONALITY_ENABLED, 0, 0, 0))
+		SKIP(return, "CONFIG_NT_FS_PERSONALITY not enabled");
+
+	ret = prctl(PR_SET_NT_PERSONALITY, 0x80000000, 0, 0, 0);
 	ASSERT_EQ(-1, ret);
 	EXPECT_EQ(EINVAL, errno);
+
+	/* The rejected call must not have disturbed the current setting. */
+	ASSERT_EQ(0, prctl(PR_GET_NT_PERSONALITY, &flags, 0, 0, 0));
+	EXPECT_EQ(NT_PERSONALITY_ENABLED, flags);
 }
 
 TEST(current_drive)
@@ -417,47 +465,27 @@ FIXTURE_TEARDOWN(nt_volume)
 		nt_control("unmount T");
 
 	if (self->dir[0]) {
-		snprintf(victim, sizeof(victim), "%s/TestFile.txt", self->dir);
-		unlink(victim);
-		snprintf(victim, sizeof(victim), "%s/MixedCaseDir",
-			 self->dir);
-		rmdir(victim);
+		static const char * const files[] = {
+			"TestFile.txt", "Meta.txt", "Born.txt", "IdA.txt",
+			"IdB.txt", "CaseMeta.txt",
+		};
+		static const char * const dirs[] = {
+			"MixedCaseDir", "MetaDir",
+		};
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(files); i++) {
+			if (!join_path(victim, sizeof(victim), self->dir,
+				       files[i]))
+				unlink(victim);
+		}
+		for (i = 0; i < ARRAY_SIZE(dirs); i++) {
+			if (!join_path(victim, sizeof(victim), self->dir,
+				       dirs[i]))
+				rmdir(victim);
+		}
 		rmdir(self->dir);
 	}
-}
-
-/*
- * Join a directory and a name without a format string, so the bound is
- * checked here rather than guessed at by the compiler.
- */
-static int join_path(char *out, size_t size, const char *dir,
-		     const char *name)
-{
-	size_t dlen = strlen(dir), nlen = strlen(name);
-
-	if (dlen + 1 + nlen + 1 > size)
-		return -1;
-
-	memcpy(out, dir, dlen);
-	out[dlen] = '/';
-	memcpy(out + dlen + 1, name, nlen);
-	out[dlen + 1 + nlen] = '\0';
-	return 0;
-}
-
-static int make_file(const char *dir, const char *name)
-{
-	char path[PATH_MAX];
-	int fd;
-
-	if (join_path(path, sizeof(path), dir, name))
-		return -1;
-
-	fd = open(path, O_CREAT | O_WRONLY, 0644);
-	if (fd < 0)
-		return -1;
-	close(fd);
-	return 0;
 }
 
 #define RESOLVE(path) \
@@ -624,6 +652,136 @@ TEST_F(nt_volume, resolve_nt_object_path)
 	ASSERT_EQ(0, nt_query("resolve", path, self->reply,
 			      sizeof(self->reply)));
 	EXPECT_STREQ(self->dir, FIELD("posix"));
+}
+
+/* --------------------------------------------------------- metadata */
+
+#define GETINFO(path) \
+	ASSERT_EQ(0, nt_query("getinfo", path, self->reply, \
+			      sizeof(self->reply)))
+
+/*
+ * DOS attributes must survive a round trip through the kernel and come
+ * back as the same mask, with the filesystem-owned bits filled in.
+ */
+TEST_F(nt_volume, metadata_attributes)
+{
+	unsigned long attrs;
+	char cmd[PATH_MAX];
+
+	ASSERT_EQ(0, make_file(self->dir, "Meta.txt"));
+
+	GETINFO("T:\\Meta.txt");
+	EXPECT_EQ(NULL, strstr(self->reply, "error"));
+
+	attrs = strtoul(FIELD("attributes"), NULL, 0);
+	/* A newly created regular file is an archive candidate. */
+	EXPECT_NE(0u, attrs & 0x20);
+	EXPECT_EQ(0u, attrs & 0x10);	/* not a directory */
+
+	snprintf(cmd, sizeof(cmd), "setattr 6 T:\\Meta.txt");
+	ASSERT_EQ(0, nt_query("getinfo", cmd, self->reply,
+			      sizeof(self->reply)));
+	EXPECT_EQ(NULL, strstr(self->reply, "error"));
+
+	GETINFO("T:\\Meta.txt");
+	attrs = strtoul(FIELD("attributes"), NULL, 0);
+	EXPECT_NE(0u, attrs & 0x02);	/* HIDDEN */
+	EXPECT_NE(0u, attrs & 0x04);	/* SYSTEM */
+}
+
+/* A directory must report FILE_ATTRIBUTE_DIRECTORY and nothing else odd. */
+TEST_F(nt_volume, metadata_directory_attribute)
+{
+	unsigned long attrs;
+	char path[PATH_MAX];
+
+	ASSERT_EQ(0, join_path(path, sizeof(path), self->dir, "MetaDir"));
+	ASSERT_EQ(0, mkdir(path, 0755));
+
+	GETINFO("T:\\MetaDir");
+	attrs = strtoul(FIELD("attributes"), NULL, 0);
+	EXPECT_NE(0u, attrs & 0x10);
+
+	rmdir(path);
+}
+
+/*
+ * CreationTime must never be silently wrong.  Whatever the backing
+ * filesystem can do, the kernel has to say whether the value is real.
+ */
+TEST_F(nt_volume, metadata_creation_time_is_labelled)
+{
+	unsigned long long creation, write;
+	int exact;
+
+	ASSERT_EQ(0, make_file(self->dir, "Born.txt"));
+
+	GETINFO("T:\\Born.txt");
+	EXPECT_EQ(NULL, strstr(self->reply, "error"));
+
+	creation = strtoull(FIELD("creation"), NULL, 10);
+	write = strtoull(FIELD("last_write"), NULL, 10);
+	exact = atoi(FIELD("creation_exact"));
+
+	/* NT time is 100ns units since 1601; anything else is a bug. */
+	EXPECT_LT(116444736000000000ULL, creation);
+	EXPECT_LT(116444736000000000ULL, write);
+
+	/* The flag is always present, and is 0 or 1. */
+	EXPECT_TRUE(exact == 0 || exact == 1);
+
+	/* An estimate must not be later than the file's last write. */
+	if (!exact)
+		EXPECT_LE(creation, write);
+}
+
+TEST_F(nt_volume, metadata_file_ids)
+{
+	unsigned long long id_a, id_b;
+	char id128_a[64], id128_b[64];
+
+	ASSERT_EQ(0, make_file(self->dir, "IdA.txt"));
+	ASSERT_EQ(0, make_file(self->dir, "IdB.txt"));
+
+	GETINFO("T:\\IdA.txt");
+	id_a = strtoull(FIELD("file_id"), NULL, 10);
+	strncpy(id128_a, FIELD("file_id_128"), sizeof(id128_a) - 1);
+	id128_a[sizeof(id128_a) - 1] = '\0';
+
+	GETINFO("T:\\IdB.txt");
+	id_b = strtoull(FIELD("file_id"), NULL, 10);
+	strncpy(id128_b, FIELD("file_id_128"), sizeof(id128_b) - 1);
+	id128_b[sizeof(id128_b) - 1] = '\0';
+
+	/* Zero means "unknown" to Windows software, so it must never appear. */
+	EXPECT_NE(0ULL, id_a);
+	EXPECT_NE(id_a, id_b);
+	EXPECT_STRNE(id128_a, id128_b);
+
+	/* Stable across queries. */
+	GETINFO("T:\\IdA.txt");
+	EXPECT_EQ(id_a, strtoull(FIELD("file_id"), NULL, 10));
+
+	/* And the volume serial is reported, not left blank. */
+	EXPECT_STRNE("00000000", FIELD("volume_serial"));
+}
+
+/* Metadata must be reachable through any casing, like everything else. */
+TEST_F(nt_volume, metadata_through_case_insensitive_path)
+{
+	unsigned long long id_exact, id_folded;
+
+	ASSERT_EQ(0, make_file(self->dir, "CaseMeta.txt"));
+
+	GETINFO("T:\\CaseMeta.txt");
+	id_exact = strtoull(FIELD("file_id"), NULL, 10);
+
+	GETINFO("T:\\casemeta.TXT");
+	EXPECT_EQ(NULL, strstr(self->reply, "error"));
+	id_folded = strtoull(FIELD("file_id"), NULL, 10);
+
+	EXPECT_EQ(id_exact, id_folded);
 }
 
 TEST_HARNESS_MAIN

@@ -11,6 +11,7 @@
  *   <debugfs>/ntpers/control	  write  mount/unmount/system commands
  *   <debugfs>/ntpers/parse	  rw     write a path, read its parse
  *   <debugfs>/ntpers/resolve	  rw     write a path, read what it resolved to
+ *   <debugfs>/ntpers/getinfo	  rw     write a path, read its NT metadata
  *   <debugfs>/ntpers/cache	  read   fold-hint cache counters
  *   <debugfs>/ntpers/personality rw     this process's personality flags
  *
@@ -276,6 +277,140 @@ static const struct file_operations nt_dbg_resolve_fops = {
 	.write		= nt_dbg_resolve_write,
 };
 
+/* -------------------------------------------------------------- getinfo */
+
+/*
+ * Resolve an NT path and report the NT view of the file: DOS attributes,
+ * all four timestamps in NT units, and the file identifiers.
+ *
+ * "setattr <hex> <path>" sets the DOS attributes instead of reporting
+ * them, so the whole metadata layer is reachable without a Win32 syscall
+ * surface.
+ */
+static ssize_t nt_dbg_getinfo_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	struct nt_dbg_state *st = file->private_data;
+	struct nt_path_parse parse;
+	struct nt_file_info info;
+	struct nt_path ntp;
+	char *input, *pbuf;
+	const char *ntpath;
+	u32 set_attrs = 0;
+	bool setting = false;
+	int err, n;
+
+	input = nt_dbg_get_input(ubuf, count);
+	if (IS_ERR(input))
+		return PTR_ERR(input);
+
+	ntpath = input;
+
+	if (!strncmp(input, "setattr ", 8)) {
+		char *attrs_arg = input + 8;
+		char *sep;
+
+		while (*attrs_arg == ' ')
+			attrs_arg++;
+
+		sep = strchr(attrs_arg, ' ');
+		if (!sep) {
+			err = -EINVAL;
+			goto out_input;
+		}
+		*sep++ = '\0';
+		while (*sep == ' ')
+			sep++;
+
+		err = kstrtou32(attrs_arg, 16, &set_attrs);
+		if (err)
+			goto out_input;
+
+		setting = true;
+		ntpath = sep;
+	}
+
+	if (!*ntpath) {
+		err = -EINVAL;
+		goto out_input;
+	}
+
+	pbuf = __getname();
+	if (!pbuf) {
+		err = -ENOMEM;
+		goto out_input;
+	}
+
+	err = nt_path_parse(ntpath, strlen(ntpath), 0, pbuf, PATH_MAX,
+			    &parse);
+	if (err)
+		goto out_report;
+
+	err = nt_path_resolve(nt_ctx_current(), &parse,
+			      NT_RESOLVE_FOLLOW | NT_RESOLVE_CASE_INSENSITIVE,
+			      &ntp);
+	if (err)
+		goto out_report;
+
+	if (setting) {
+		err = nt_set_file_attributes(&ntp.path, set_attrs);
+		if (err) {
+			nt_path_put(&ntp);
+			goto out_report;
+		}
+	}
+
+	err = nt_query_file_info(&ntp.path, ntp.volume, &info);
+	nt_path_put(&ntp);
+	if (err)
+		goto out_report;
+
+	mutex_lock(&st->lock);
+	n = scnprintf(st->result, NT_DBG_RESULT_SIZE,
+		      "ok\nattributes 0x%08x\nreparse_tag 0x%08x\n"
+		      "creation %llu\ncreation_exact %d\n"
+		      "last_access %llu\nlast_write %llu\nchange %llu\n"
+		      "file_id %llu\nfile_id_128 %16phN\n"
+		      "volume_serial %08X\nsize %llu\nalloc_size %llu\n"
+		      "nlink %u\n",
+		      info.attributes, info.reparse_tag,
+		      nt_time_from_timespec(&info.creation),
+		      !!(info.time_flags & NT_TIME_CREATION_EXACT),
+		      nt_time_from_timespec(&info.last_access),
+		      nt_time_from_timespec(&info.last_write),
+		      nt_time_from_timespec(&info.change),
+		      info.file_id, info.file_id_128,
+		      info.volume_serial, info.size, info.alloc_size,
+		      info.nlink);
+	st->result_len = n;
+	mutex_unlock(&st->lock);
+
+	err = 0;
+	goto out_name;
+
+out_report:
+	mutex_lock(&st->lock);
+	st->result_len = scnprintf(st->result, NT_DBG_RESULT_SIZE,
+				   "error %d\n", err);
+	mutex_unlock(&st->lock);
+	err = 0;
+
+out_name:
+	__putname(pbuf);
+out_input:
+	kfree(input);
+	*ppos = 0;
+	return err ? err : count;
+}
+
+static const struct file_operations nt_dbg_getinfo_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nt_dbg_open,
+	.release	= nt_dbg_release,
+	.read		= nt_dbg_read,
+	.write		= nt_dbg_getinfo_write,
+};
+
 /* -------------------------------------------------------------- control */
 
 /*
@@ -488,6 +623,8 @@ int __init nt_debugfs_init(void)
 			    &nt_dbg_resolve_fops);
 	debugfs_create_file("personality", 0600, nt_debugfs_root, NULL,
 			    &nt_dbg_pers_fops);
+	debugfs_create_file("getinfo", 0600, nt_debugfs_root, NULL,
+			    &nt_dbg_getinfo_fops);
 
 	return 0;
 }

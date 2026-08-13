@@ -15,109 +15,36 @@
  * has its own coverage in fs/unicode.
  */
 
-#include <kunit/test.h>
 #include <linux/cred.h>
-#include <linux/dcache.h>
-#include <linux/fs.h>
-#include <linux/fs_context.h>
-#include <linux/mount.h>
-#include <linux/namei.h>
-#include <linux/slab.h>
 #include <linux/nt_personality.h>
 
-struct nt_cf_test_ctx {
-	struct file_system_type	*fstype;
-	struct vfsmount		*mnt;
-	struct path		root;
-};
+#include "ntpers_kunit.h"
 
 static int nt_cf_test_init(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx;
+	struct nt_test_fs *fs;
 
-	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
+	fs = kunit_kzalloc(test, sizeof(*fs), GFP_KERNEL);
+	if (!fs)
 		return -ENOMEM;
-	test->priv = ctx;
+	test->priv = fs;
 
-	/*
-	 * tmpfs if it is available, ramfs otherwise.  Either gives us a
-	 * private, writable, case-sensitive filesystem, which is what
-	 * these tests need.
-	 */
-	ctx->fstype = get_fs_type("tmpfs");
-	if (!ctx->fstype)
-		ctx->fstype = get_fs_type("ramfs");
-	if (!ctx->fstype)
-		kunit_skip(test, "neither tmpfs nor ramfs available");
-
-	ctx->mnt = kern_mount(ctx->fstype);
-	if (IS_ERR(ctx->mnt)) {
-		int err = PTR_ERR(ctx->mnt);
-
-		ctx->mnt = NULL;
-		put_filesystem(ctx->fstype);
-		ctx->fstype = NULL;
-		return err;
-	}
-
-	ctx->root.mnt = ctx->mnt;
-	ctx->root.dentry = ctx->mnt->mnt_root;
-	path_get(&ctx->root);
-
-	return 0;
+	return nt_test_fs_init(test, fs);
 }
 
 static void nt_cf_test_exit(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = test->priv;
-
-	if (!ctx)
-		return;
-
-	if (ctx->root.dentry)
-		path_put(&ctx->root);
-	if (ctx->mnt)
-		kern_unmount(ctx->mnt);
-	if (ctx->fstype)
-		put_filesystem(ctx->fstype);
+	if (test->priv)
+		nt_test_fs_exit(test->priv);
 }
 
-#define CTX(test) ((struct nt_cf_test_ctx *)(test)->priv)
+#define CTX(test) ((struct nt_test_fs *)(test)->priv)
 
-/*
- * Create a file or directory with an exact name, the way a real
- * filesystem would hold it, so that a differently-cased lookup has
- * something genuine to find.
- */
+/* Create in the fixture root; the fixture owns the reference. */
 static struct dentry *nt_cf_create(struct kunit *test, struct dentry *parent,
 				   const char *name, bool dir)
 {
-	struct qstr q = QSTR_INIT(name, strlen(name));
-	struct dentry *child, *made;
-	int err;
-
-	child = start_creating_noperm(parent, &q);
-	if (IS_ERR(child))
-		return child;
-
-	if (dir) {
-		made = vfs_mkdir(&nop_mnt_idmap, d_inode(parent), child,
-				 0755, NULL);
-		if (IS_ERR(made)) {
-			end_creating(child);
-			return made;
-		}
-		return end_creating_keep(made);
-	}
-
-	err = vfs_create(&nop_mnt_idmap, child, 0644, NULL);
-	if (err) {
-		end_creating(child);
-		return ERR_PTR(err);
-	}
-
-	return end_creating_keep(child);
+	return nt_test_create(test, CTX(test), parent, name, dir);
 }
 
 /* Look @name up case-insensitively and assert the spelling we get back. */
@@ -158,7 +85,7 @@ static void expect_ci_misses(struct kunit *test, const struct path *dir,
  */
 static void test_ci_lookup_preserves_case(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *file;
 
 	file = nt_cf_create(test, ctx->root.dentry, "TestFile.txt", false);
@@ -173,8 +100,6 @@ static void test_ci_lookup_preserves_case(struct kunit *test)
 	/* A name that differs by more than case must still not be found. */
 	expect_ci_misses(test, &ctx->root, "TestFile2.txt");
 	expect_ci_misses(test, &ctx->root, "TestFil.txt");
-
-	dput(file);
 }
 
 /*
@@ -184,7 +109,7 @@ static void test_ci_lookup_preserves_case(struct kunit *test)
  */
 static void test_ci_lookup_is_cached(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *file;
 	int i;
 
@@ -195,8 +120,6 @@ static void test_ci_lookup_is_cached(struct kunit *test)
 	for (i = 0; i < 5; i++)
 		expect_ci_finds(test, &ctx->root, "cachedname.dat",
 				"CachedName.dat");
-
-	dput(file);
 }
 
 /*
@@ -206,7 +129,7 @@ static void test_ci_lookup_is_cached(struct kunit *test)
  */
 static void test_ci_stale_hint_is_reverified(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *file, *victim;
 	struct qstr q;
 	int err;
@@ -225,7 +148,6 @@ static void test_ci_stale_hint_is_reverified(struct kunit *test)
 			 NULL);
 	end_removing_path(&ctx->root, victim);
 	KUNIT_ASSERT_EQ(test, err, 0);
-	dput(file);
 
 	/* The stale hint must not resurrect it. */
 	expect_ci_misses(test, &ctx->root, "RENAMED.TXT");
@@ -235,8 +157,6 @@ static void test_ci_stale_hint_is_reverified(struct kunit *test)
 	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
 	expect_ci_finds(test, &ctx->root, "renamed.txt", "RENAMED.txt");
 	expect_ci_finds(test, &ctx->root, "Renamed.Txt", "RENAMED.txt");
-
-	dput(file);
 }
 
 /* Two names that differ only by case can both exist on a case-sensitive
@@ -245,7 +165,7 @@ static void test_ci_stale_hint_is_reverified(struct kunit *test)
  */
 static void test_ci_exact_match_wins(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *lower, *upper;
 
 	lower = nt_cf_create(test, ctx->root.dentry, "clash.txt", false);
@@ -255,14 +175,11 @@ static void test_ci_exact_match_wins(struct kunit *test)
 
 	expect_ci_finds(test, &ctx->root, "clash.txt", "clash.txt");
 	expect_ci_finds(test, &ctx->root, "CLASH.TXT", "CLASH.TXT");
-
-	dput(lower);
-	dput(upper);
 }
 
 static void test_ci_lookup_directories(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *dir, *inner;
 	struct path dirpath;
 
@@ -280,15 +197,12 @@ static void test_ci_lookup_directories(struct kunit *test)
 	dirpath.dentry = dir;
 	expect_ci_finds(test, &dirpath, "system32", "System32");
 	expect_ci_finds(test, &dirpath, "SYSTEM32", "System32");
-
-	dput(inner);
-	dput(dir);
 }
 
 /* A whole Windows 7 style path, walked case-insensitively end to end. */
 static void test_ci_resolve_windows_layout(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *windows, *system32, *dll;
 	struct nt_namespace *ns;
 	struct nt_path_parse parse;
@@ -389,16 +303,12 @@ static void test_ci_resolve_windows_layout(struct kunit *test)
 	nt_volume_destroy(ns, vol);
 	nt_volume_put(vol);
 	nt_ns_put(ns);
-
-	dput(dll);
-	dput(system32);
-	dput(windows);
 }
 
 /* Unicode names must survive folding rather than becoming unreachable. */
 static void test_ci_unicode_names(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *file;
 
 	file = nt_cf_create(test, ctx->root.dentry, "Документы", true);
@@ -407,8 +317,6 @@ static void test_ci_unicode_names(struct kunit *test)
 	/* Exact match always works, whatever the folding rules say. */
 	expect_ci_finds(test, &ctx->root, "Документы", "Документы");
 
-	dput(file);
-
 	/*
 	 * A name whose case folding is pure ASCII must fold even when the
 	 * rest of it is not.
@@ -416,12 +324,11 @@ static void test_ci_unicode_names(struct kunit *test)
 	file = nt_cf_create(test, ctx->root.dentry, "Ünïcøde-DIR", true);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
 	expect_ci_finds(test, &ctx->root, "Ünïcøde-dir", "Ünïcøde-DIR");
-	dput(file);
 }
 
 static void test_ci_argument_checking(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	struct dentry *file;
 	struct path found;
 	struct path filepath;
@@ -447,7 +354,6 @@ static void test_ci_argument_checking(struct kunit *test)
 	filepath.dentry = file;
 	KUNIT_EXPECT_EQ(test, nt_ci_lookup(&filepath, "x", 1, &found),
 			-ENOTDIR);
-	dput(file);
 }
 
 /*
@@ -463,7 +369,7 @@ static void test_ci_argument_checking(struct kunit *test)
  */
 static void test_ci_scan_needs_read_permission(struct kunit *test)
 {
-	struct nt_cf_test_ctx *ctx = CTX(test);
+	struct nt_test_fs *ctx = CTX(test);
 	const struct cred *old_cred;
 	struct dentry *dir, *file;
 	struct path dirpath, found;
@@ -484,18 +390,12 @@ static void test_ci_scan_needs_read_permission(struct kunit *test)
 	inode_lock(d_inode(dir));
 	err = notify_change(&nop_mnt_idmap, dir, &attr, NULL);
 	inode_unlock(d_inode(dir));
-	if (err) {
-		dput(file);
-		dput(dir);
+	if (err)
 		kunit_skip(test, "could not drop read permission (%d)", err);
-	}
 
 	unpriv = prepare_creds();
-	if (!unpriv) {
-		dput(file);
-		dput(dir);
+	if (!unpriv)
 		kunit_skip(test, "could not prepare credentials");
-	}
 
 	/*
 	 * Drop every capability that would let the caller ignore the mode,
@@ -531,9 +431,6 @@ static void test_ci_scan_needs_read_permission(struct kunit *test)
 
 	revert_creds(old_cred);
 	put_cred(unpriv);
-
-	dput(file);
-	dput(dir);
 }
 
 static struct kunit_case nt_casefold_test_cases[] = {
