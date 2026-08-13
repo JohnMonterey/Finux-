@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/fs_struct.h>
 #include <linux/init_task.h>
+#include <linux/nt_personality.h>
 #include "internal.h"
 
 /*
@@ -82,6 +83,7 @@ void chroot_fs_refs(const struct path *old_root, const struct path *new_root)
 
 void free_fs_struct(struct fs_struct *fs)
 {
+	nt_fs_struct_free(fs);
 	path_put(&fs->root);
 	path_put(&fs->pwd);
 	kmem_cache_free(fs_cachep, fs);
@@ -120,6 +122,13 @@ struct fs_struct *copy_fs_struct(struct fs_struct *old)
 		fs->pwd = old->pwd;
 		path_get(&fs->pwd);
 		read_sequnlock_excl(&old->seq);
+
+		if (nt_fs_struct_copy(fs, old)) {
+			path_put(&fs->root);
+			path_put(&fs->pwd);
+			kmem_cache_free(fs_cachep, fs);
+			return NULL;
+		}
 	}
 	return fs;
 }

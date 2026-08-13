@@ -416,4 +416,26 @@ struct prctl_mm_map {
 # define PR_CFI_DISABLE		_BITUL(1)
 # define PR_CFI_LOCK		_BITUL(2)
 
+/*
+ * Get or set the NT filesystem personality of the calling process.
+ *
+ * arg2 of PR_SET_NT_PERSONALITY is a mask of NT_PERSONALITY_* from
+ * <linux/nt_personality.h>; PR_GET_NT_PERSONALITY writes the current
+ * mask through the pointer in arg2.  The personality only changes how
+ * this process's own pathnames are interpreted by NT-aware interfaces;
+ * POSIX pathname resolution is unaffected either way.
+ *
+ * Both fail with -EINVAL when CONFIG_NT_FS_PERSONALITY is not enabled.
+ */
+#define PR_SET_NT_PERSONALITY	82
+#define PR_GET_NT_PERSONALITY	83
+
+/*
+ * Get or set the calling process's current NT drive letter, as a single
+ * ASCII character in arg2.  This is what an unqualified "\Windows"
+ * resolves against.
+ */
+#define PR_SET_NT_DRIVE		84
+#define PR_GET_NT_DRIVE		85
+
 #endif /* _LINUX_PRCTL_H */

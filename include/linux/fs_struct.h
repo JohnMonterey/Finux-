@@ -7,12 +7,25 @@
 #include <linux/spinlock.h>
 #include <linux/seqlock.h>
 
+struct nt_task_ctx;
+
 struct fs_struct {
 	int users;
 	seqlock_t seq;
 	int umask;
 	int in_exec;
 	struct path root, pwd;
+#ifdef CONFIG_NT_FS_PERSONALITY
+	/*
+	 * NT filesystem personality state: current drive, per-drive
+	 * current directories, and which NT namespace this process
+	 * resolves against.  It lives here so that it is shared and
+	 * copied on exactly the same terms as the root and current
+	 * directory above.  NULL for every process that has not opted in,
+	 * which is all of them until something calls prctl().
+	 */
+	struct nt_task_ctx *nt_ctx;
+#endif
 } __randomize_layout;
 
 extern struct kmem_cache *fs_cachep;

@@ -43,6 +43,7 @@
 #include <linux/syscore_ops.h>
 #include <linux/version.h>
 #include <linux/ctype.h>
+#include <linux/nt_personality.h>
 #include <linux/syscall_user_dispatch.h>
 
 #include <linux/compat.h>
@@ -2907,6 +2908,39 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg3 & PR_CFI_LOCK && !(arg3 & PR_CFI_DISABLE))
 			error = arch_prctl_lock_branch_landing_pad_state(me);
 		break;
+#ifdef CONFIG_NT_FS_PERSONALITY
+	case PR_SET_NT_PERSONALITY:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = nt_personality_set((u32)arg2);
+		break;
+	case PR_GET_NT_PERSONALITY:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = put_user(nt_personality_get(),
+				 (unsigned int __user *)arg2);
+		break;
+	case PR_SET_NT_DRIVE: {
+		struct nt_task_ctx *ctx;
+
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		ctx = nt_ctx_current_or_create();
+		if (!ctx)
+			return -ENOMEM;
+		error = nt_ctx_set_current_drive(ctx, (u8)arg2);
+		break;
+	}
+	case PR_GET_NT_DRIVE: {
+		struct nt_task_ctx *ctx = nt_ctx_current();
+
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = put_user(ctx ? READ_ONCE(ctx->cur_drive) : 0,
+				 (unsigned int __user *)arg2);
+		break;
+	}
+#endif
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
 		error = -EINVAL;
