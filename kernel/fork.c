@@ -632,7 +632,24 @@ static void check_mm(struct mm_struct *mm)
 			 "Please make sure 'struct resident_page_types[]' is updated as well");
 
 	for (i = 0; i < NR_MM_COUNTERS; i++) {
-		long x = percpu_counter_sum(&mm->rss_stat[i]);
+		/*
+		 * percpu_counter_sum() takes the counter's lock and reads
+		 * every online CPU's slot.  Doing that NR_MM_COUNTERS times
+		 * for every mm that is torn down is a lot of remote cacheline
+		 * traffic under a raw spinlock, spent to detect a condition a
+		 * working kernel never reaches.
+		 *
+		 * The folded total costs nothing to read, and a leak large
+		 * enough to have spilled out of a per-CPU batch appears in it,
+		 * so use it to decide whether the exact sum is worth taking.
+		 * Kernels built for debugging still pay for the precise check,
+		 * which is where a small residue left in a per-CPU slot has to
+		 * be caught.
+		 */
+		long x = percpu_counter_read(&mm->rss_stat[i]);
+
+		if (IS_ENABLED(CONFIG_DEBUG_VM) || unlikely(x))
+			x = percpu_counter_sum(&mm->rss_stat[i]);
 
 		if (unlikely(x)) {
 			pr_alert("BUG: Bad rss-counter state mm:%p type:%s val:%ld Comm:%s Pid:%d\n",
