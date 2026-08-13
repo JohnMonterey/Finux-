@@ -2457,7 +2457,6 @@ config MITIGATION_CALL_DEPTH_TRACKING
 	depends on CPU_SUP_INTEL && HAVE_CALL_THUNKS
 	select HAVE_DYNAMIC_FTRACE_NO_PATCHABLE
 	select CALL_THUNKS
-	default y
 	help
 	  Compile the kernel with call depth tracking to mitigate the Intel
 	  SKL Return-Stack-Buffer (RSB) underflow issue. The mitigation is off
@@ -2468,6 +2467,15 @@ config MITIGATION_CALL_DEPTH_TRACKING
 	  patching. This increases text size by ~5%. For non affected systems
 	  this space is unused. On affected SKL systems this results in a
 	  significant performance gain over the IBRS mitigation.
+
+	  The ~5% is paid at build time by every kernel that sets this,
+	  whether or not retbleed=stuff is ever passed, and it is 16 bytes
+	  of padding in front of every function - which costs instruction
+	  cache and iTLB coverage on paths that have nothing to do with the
+	  mitigation.  Because the mitigation itself is opt-in at boot,
+	  this defaults to n here rather than y as upstream has it.  Say Y
+	  if you run a Skylake-generation Intel CPU and intend to use
+	  retbleed=stuff; nothing else is affected by turning it off.
 
 config CALL_THUNKS_DEBUG
 	bool "Enable call thunks and call depth tracking debugging"
