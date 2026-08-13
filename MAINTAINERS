@@ -19288,6 +19288,15 @@ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/linkinjeon/ntfs.git
 F:	Documentation/filesystems/ntfs.rst
 F:	fs/ntfs/
 
+NT FILESYSTEM PERSONALITY
+S:	Maintained
+F:	Documentation/filesystems/nt-personality.rst
+F:	fs/ntpers/
+F:	include/linux/nt_personality.h
+F:	include/trace/events/ntpers.h
+F:	include/uapi/linux/nt_personality.h
+F:	tools/testing/selftests/filesystems/nt_personality/
+
 NTFS3 FILESYSTEM
 M:	Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
 L:	ntfs3@lists.linux.dev

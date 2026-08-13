@@ -416,6 +416,7 @@ source "fs/9p/Kconfig"
 
 endif # NETWORK_FILESYSTEMS
 
+source "fs/ntpers/Kconfig"
 source "fs/nls/Kconfig"
 source "fs/dlm/Kconfig"
 source "fs/unicode/Kconfig"

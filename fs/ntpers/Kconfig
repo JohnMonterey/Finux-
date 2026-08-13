@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config NT_FS_PERSONALITY
+	bool "NT filesystem personality (EXPERIMENTAL)"
+	select UNICODE
+	help
+	  Give the kernel a first-class notion of an NT-style filesystem
+	  namespace: volumes with drive letters, NT device names, and an
+	  NT/Win32 pathname resolver layered on top of the ordinary VFS.
+
+	  This does not replace POSIX pathname resolution and it does not
+	  require any particular backing filesystem.  Processes that do not
+	  opt in through prctl(PR_SET_NT_PERSONALITY) are unaffected, so
+	  enabling this option is safe on an otherwise normal system.
+
+	  It is a building block for a future PE loader and Win32
+	  compatibility subsystem, which need "C:\Windows\System32" to be a
+	  real system-wide path rather than a per-application illusion.
+
+	  If unsure, say N.
+
+config NT_FS_PERSONALITY_DEBUGFS
+	bool "NT personality debugfs interface"
+	depends on NT_FS_PERSONALITY && DEBUG_FS
+	default y
+	help
+	  Export the volume table and a pathname resolution test interface
+	  under <debugfs>/ntpers.  This is how the selftests in
+	  tools/testing/selftests/filesystems/nt_personality drive the
+	  resolver before a Win32 syscall surface exists.
+
+	  If unsure, say Y.
+
+config NT_FS_PERSONALITY_KUNIT_TEST
+	tristate "KUnit tests for the NT filesystem personality" if !KUNIT_ALL_TESTS
+	depends on NT_FS_PERSONALITY && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for the NT/Win32 pathname parser, the drive letter and
+	  volume registry, and the Win32 reserved-name rules.
+
+	  If unsure, say N.
