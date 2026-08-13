@@ -231,6 +231,37 @@ static inline void psi_account_irqtime(struct rq *rq, struct task_struct *curr,
 
 #ifdef CONFIG_SCHED_INFO
 /*
+ * Record the extremes of a task's run delay.
+ *
+ * These three fields have exactly one reader, __delayacct_add_tsk(), which
+ * reports them through taskstats.  Delay accounting is off until userspace
+ * turns it on, so gate the work on the same static key the rest of
+ * delayacct uses: with it off nothing can observe the result, and one of
+ * the two updates is a wall-clock read taken with the runqueue lock held.
+ *
+ * The cumulative counters above are deliberately not gated.  run_delay and
+ * pcount are also read by /proc/<pid>/schedstat and by KVM's steal-time
+ * accounting, neither of which announces itself in advance.
+ *
+ * A Kconfig option would not do here: CONFIG_SCHED_INFO is force-selected
+ * by CONFIG_KVM, so a kernel that can run virtual machines cannot opt out
+ * of this code at build time.
+ */
+static inline void sched_info_record_extremes(struct task_struct *t,
+					      unsigned long long delta)
+{
+	if (!delayacct_enabled())
+		return;
+
+	if (delta > t->sched_info.max_run_delay) {
+		t->sched_info.max_run_delay = delta;
+		ktime_get_real_ts64(&t->sched_info.max_run_delay_ts);
+	}
+	if (delta && (!t->sched_info.min_run_delay || delta < t->sched_info.min_run_delay))
+		t->sched_info.min_run_delay = delta;
+}
+
+/*
  * We are interested in knowing how long it was from the *first* time a
  * task was queued to the time that it finally hit a CPU, we call this routine
  * from dequeue_task() to account for possible rq->clock skew across CPUs. The
@@ -246,12 +277,7 @@ static inline void sched_info_dequeue(struct rq *rq, struct task_struct *t)
 	delta = rq_clock(rq) - t->sched_info.last_queued;
 	t->sched_info.last_queued = 0;
 	t->sched_info.run_delay += delta;
-	if (delta > t->sched_info.max_run_delay) {
-		t->sched_info.max_run_delay = delta;
-		ktime_get_real_ts64(&t->sched_info.max_run_delay_ts);
-	}
-	if (delta && (!t->sched_info.min_run_delay || delta < t->sched_info.min_run_delay))
-		t->sched_info.min_run_delay = delta;
+	sched_info_record_extremes(t, delta);
 	rq_sched_info_dequeue(rq, delta);
 }
 
@@ -273,12 +299,7 @@ static void sched_info_arrive(struct rq *rq, struct task_struct *t)
 	t->sched_info.run_delay += delta;
 	t->sched_info.last_arrival = now;
 	t->sched_info.pcount++;
-	if (delta > t->sched_info.max_run_delay) {
-		t->sched_info.max_run_delay = delta;
-		ktime_get_real_ts64(&t->sched_info.max_run_delay_ts);
-	}
-	if (delta && (!t->sched_info.min_run_delay || delta < t->sched_info.min_run_delay))
-		t->sched_info.min_run_delay = delta;
+	sched_info_record_extremes(t, delta);
 
 	rq_sched_info_arrive(rq, delta);
 }

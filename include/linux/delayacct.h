@@ -108,6 +108,19 @@ extern void __delayacct_wpcopy_start(void);
 extern void __delayacct_wpcopy_end(void);
 extern void __delayacct_irq(struct task_struct *task, u32 delta);
 
+/*
+ * Is anything going to read the numbers we are about to collect?
+ *
+ * Delay accounting is off until userspace asks for it, so callers that
+ * maintain data used only by taskstats can skip the work entirely.  The
+ * individual delayacct_*() helpers already test this key; this exposes it
+ * for collection sites that live outside this file.
+ */
+static inline bool delayacct_enabled(void)
+{
+	return static_branch_unlikely(&delayacct_key);
+}
+
 static inline void delayacct_tsk_init(struct task_struct *tsk)
 {
 	/* reinitialize in case parent's non-null pointer was dup'ed*/
@@ -251,6 +264,8 @@ static inline void delayacct_irq(struct task_struct *task, u32 delta)
 }
 
 #else
+static inline bool delayacct_enabled(void)
+{ return false; }
 static inline void delayacct_init(void)
 {}
 static inline void delayacct_tsk_init(struct task_struct *tsk)
