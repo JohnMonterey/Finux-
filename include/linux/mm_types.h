@@ -1611,14 +1611,24 @@ static inline unsigned int mm_cid_size(void)
 #ifdef CONFIG_SCHED_CACHE
 void mm_init_sched(struct mm_struct *mm,
 		   struct sched_cache_time __percpu *pcpu_sched);
+bool sched_cache_supported(void);
 
 static inline int mm_alloc_sched_noprof(struct mm_struct *mm)
 {
-	struct sched_cache_time __percpu *pcpu_sched =
-		alloc_percpu_noprof(struct sched_cache_time);
+	struct sched_cache_time __percpu *pcpu_sched = NULL;
 
-	if (!pcpu_sched)
-		return -ENOMEM;
+	/*
+	 * Only hardware with more than one last-level cache has anywhere
+	 * to balance between, and on everything else this allocation and
+	 * the per-CPU loop that initialises it are paid on every fork and
+	 * every exec for state nothing will read.  mm_init_sched() still
+	 * runs, to clear the pointer dup_mm() copied from the parent.
+	 */
+	if (sched_cache_supported()) {
+		pcpu_sched = alloc_percpu_noprof(struct sched_cache_time);
+		if (!pcpu_sched)
+			return -ENOMEM;
+	}
 
 	mm_init_sched(mm, pcpu_sched);
 	return 0;

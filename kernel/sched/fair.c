@@ -1572,20 +1572,31 @@ static void account_llc_dequeue(struct rq *rq, struct task_struct *p)
 	}
 }
 
+/*
+ * @_pcpu_sched may be NULL: on hardware with a single last-level cache
+ * there is nowhere for the cache-aware balancer to move a task to, so
+ * mm_alloc_sched() does not allocate the per-CPU state.  The rest of the
+ * initialisation still has to run, because this mm's fields were copied
+ * wholesale from its parent by dup_mm() and the inherited pcpu_sched
+ * pointer must not survive.
+ */
 void mm_init_sched(struct mm_struct *mm,
 		   struct sched_cache_time __percpu *_pcpu_sched)
 {
 	unsigned long epoch = 0;
 	int i;
 
-	for_each_possible_cpu(i) {
-		struct sched_cache_time *pcpu_sched = per_cpu_ptr(_pcpu_sched, i);
-		struct rq *rq = cpu_rq(i);
+	if (_pcpu_sched) {
+		for_each_possible_cpu(i) {
+			struct sched_cache_time *pcpu_sched =
+				per_cpu_ptr(_pcpu_sched, i);
+			struct rq *rq = cpu_rq(i);
 
-		pcpu_sched->runtime = 0;
-		/* a slightly stale cpu epoch is acceptible */
-		pcpu_sched->epoch = rq->cpu_epoch;
-		epoch = rq->cpu_epoch;
+			pcpu_sched->runtime = 0;
+			/* a slightly stale cpu epoch is acceptible */
+			pcpu_sched->epoch = rq->cpu_epoch;
+			epoch = rq->cpu_epoch;
+		}
 	}
 
 	raw_spin_lock_init(&mm->sc_stat.lock);

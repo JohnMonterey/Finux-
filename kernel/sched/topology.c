@@ -848,6 +848,28 @@ enum s_alloc {
 #ifdef CONFIG_SCHED_CACHE
 /* hardware support for cache aware scheduling */
 DEFINE_STATIC_KEY_FALSE(sched_cache_present);
+
+/*
+ * Is there more than one last-level cache to balance between?
+ *
+ * Exported for mm_alloc_sched(), which uses it to decide whether a new mm
+ * needs the per-CPU occupancy state the cache-aware balancer reads.  On a
+ * single-LLC machine - most desktops and laptops - that allocation and
+ * its for_each_possible_cpu() initialisation are paid on every fork and
+ * exec to feed a balancer whose every entry point is already switched
+ * off.  Readers all tolerate a NULL mm->sc_stat.pcpu_sched.
+ *
+ * This is deliberately keyed on the hardware rather than on
+ * sched_cache_active, which also tracks the sysctl: an mm created while
+ * the sysctl was off would otherwise sit out cache-aware scheduling for
+ * its whole life if the sysctl were later turned on.  Multi-LLC hardware
+ * settles this key once, during the initial sched domain build, before
+ * user space starts.
+ */
+bool sched_cache_supported(void)
+{
+	return static_branch_unlikely(&sched_cache_present);
+}
 /*
  * Indicator of whether cache aware scheduling
  * is active, used by the scheduler.
