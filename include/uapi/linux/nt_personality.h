@@ -341,6 +341,163 @@ enum nt_path_type {
 #define STATUS_HANDLE_NOT_CLOSABLE	0xC0000235
 
 /*
+ * Codes the file calls (create, open, read, write, query) return, at their
+ * real Windows NTSTATUS values so a personality can compare against them
+ * directly.  STATUS_END_OF_FILE is a warning-severity code (0x8...) rather
+ * than an error, exactly as NtReadFile returns it at end of file.
+ */
+#define STATUS_UNSUCCESSFUL		0xC0000001
+#define STATUS_NOT_IMPLEMENTED		0xC0000002
+#define STATUS_INFO_LENGTH_MISMATCH	0xC0000004
+#define STATUS_ACCESS_VIOLATION		0xC0000005
+#define STATUS_INVALID_DEVICE_REQUEST	0xC0000010
+#define STATUS_END_OF_FILE		0xC0000011
+#define STATUS_ACCESS_DENIED		0xC0000022
+#define STATUS_BUFFER_TOO_SMALL		0xC0000023
+#define STATUS_OBJECT_NAME_INVALID	0xC0000033
+#define STATUS_OBJECT_NAME_NOT_FOUND	0xC0000034
+#define STATUS_OBJECT_NAME_COLLISION	0xC0000035
+#define STATUS_OBJECT_PATH_NOT_FOUND	0xC000003A
+#define STATUS_SHARING_VIOLATION	0xC0000043
+#define STATUS_EAS_NOT_SUPPORTED	0xC000004F
+#define STATUS_DISK_FULL		0xC000007F
+#define STATUS_DELETE_PENDING		0xC0000056
+#define STATUS_FILE_IS_A_DIRECTORY	0xC00000BA
+#define STATUS_NOT_SUPPORTED		0xC00000BB
+#define STATUS_NOT_A_DIRECTORY		0xC0000103
+#define STATUS_NAME_TOO_LONG		0xC0000106
+
+/*
+ * ---------------------------------------------------------------------
+ * NtCreateFile / NtReadFile / ... marshalling ABI  (layer: NT kernel)
+ * ---------------------------------------------------------------------
+ *
+ * The structures a native NT caller passes NtCreateFile and its kin.  They
+ * mirror the 64-bit Windows layout exactly - the byte offsets and total
+ * sizes are asserted at build time in fs/ntpers/syscall.c - but use
+ * kernel-idiomatic lower-case field names, as the other NT-mirroring
+ * structures in this subsystem do (see struct nt_sd_relative in
+ * fs/ntpers/meta.c).  Each field carries its Windows name in a comment.
+ *
+ * Pointers are carried as __u64 so the layout is identical whatever the
+ * caller's word size; a native AMD64 PE is LP64, so they are genuine 64-bit
+ * pointers there.
+ */
+
+/* UNICODE_STRING - 16 bytes. */
+struct nt_unicode_string {
+	__u16	length;			/* Length: bytes in use, sans any NUL */
+	__u16	maximum_length;		/* MaximumLength: bytes of buffer */
+	__u32	__pad;
+	__u64	buffer;			/* Buffer: pointer to UTF-16LE units */
+};
+
+/* OBJECT_ATTRIBUTES - 48 bytes. */
+struct nt_object_attributes {
+	__u32	length;			/* Length: sizeof(this) */
+	__u32	__pad0;
+	__u64	root_directory;		/* RootDirectory: a HANDLE, or 0 */
+	__u64	object_name;		/* ObjectName: nt_unicode_string * */
+	__u32	attributes;		/* Attributes: OBJ_* below */
+	__u32	__pad1;
+	__u64	security_descriptor;	/* SecurityDescriptor */
+	__u64	security_qos;		/* SecurityQualityOfService */
+};
+
+/* IO_STATUS_BLOCK - 16 bytes. */
+struct nt_io_status_block {
+	union {
+		__u32	status;		/* Status: the operation's NTSTATUS */
+		__u64	pointer;	/* Pointer: keeps the union 8 bytes */
+	};
+	__u64	information;		/* Information: op result / byte count */
+};
+
+/*
+ * OBJECT_ATTRIBUTES.Attributes bits.  Only the one that changes name
+ * resolution here is honoured; the rest are accepted and ignored.
+ */
+#define NT_OBJ_INHERIT			0x00000002
+#define NT_OBJ_CASE_INSENSITIVE		0x00000040
+
+/*
+ * CreateDisposition (NtCreateFile) values.  These are the NT kernel numbers,
+ * which differ from the Win32 CreateFile dwCreationDisposition numbering that
+ * NT_DISPOSITION_* above carries; fs/ntpers/syscall.c maps between the two.
+ * FILE_SUPERSEDE has no NT_DISPOSITION_* equivalent - superseding resets a
+ * file's attributes and reports FILE_SUPERSEDED, which nt_create() does not
+ * do - so the wrapper returns STATUS_NOT_IMPLEMENTED for it.
+ */
+#define NT_FILE_SUPERSEDE		0
+#define NT_FILE_OPEN			1
+#define NT_FILE_CREATE			2
+#define NT_FILE_OPEN_IF			3
+#define NT_FILE_OVERWRITE		4
+#define NT_FILE_OVERWRITE_IF		5
+
+/*
+ * CreateOptions (NtCreateFile) / OpenOptions (NtOpenFile) bits this layer
+ * honours.  Everything else a caller passes is accepted and ignored, because
+ * it selects a caching or completion behaviour this scaffold does not change
+ * (FILE_WRITE_THROUGH, FILE_SYNCHRONOUS_IO_NONALERT, ...) rather than what
+ * object is opened.
+ */
+#define NT_FILE_DIRECTORY_FILE		0x00000001
+#define NT_FILE_NON_DIRECTORY_FILE	0x00000040
+#define NT_FILE_DELETE_ON_CLOSE		0x00001000
+#define NT_FILE_OPEN_REPARSE_POINT	0x00200000
+
+/*
+ * IoStatusBlock.Information after a create/open: what actually happened.
+ * These are the real Windows FILE_* values, which again differ from the
+ * NT_RESULT_* numbering used internally; the wrapper maps NT_RESULT_* to
+ * these on the way out.
+ */
+#define NT_FILE_SUPERSEDED		0
+#define NT_FILE_OPENED			1
+#define NT_FILE_CREATED			2
+#define NT_FILE_OVERWRITTEN		3
+#define NT_FILE_EXISTS			4
+#define NT_FILE_DOES_NOT_EXIST		5
+
+/*
+ * FILE_INFORMATION_CLASS subset for NtQueryInformationFile.  The values are
+ * the NT enumerators (FileBasicInformation == 4, FileStandardInformation ==
+ * 5); any other class returns STATUS_NOT_IMPLEMENTED.
+ */
+#define NT_FILEINFO_BASIC		4
+#define NT_FILEINFO_STANDARD		5
+
+/* FILE_BASIC_INFORMATION - 40 bytes. Times are NT 100ns ticks since 1601. */
+struct nt_file_basic_information {
+	__s64	creation_time;		/* CreationTime */
+	__s64	last_access_time;	/* LastAccessTime */
+	__s64	last_write_time;	/* LastWriteTime */
+	__s64	change_time;		/* ChangeTime */
+	__u32	file_attributes;	/* FileAttributes: NT_FILE_ATTRIBUTE_* */
+	__u32	__pad;
+};
+
+/* FILE_STANDARD_INFORMATION - 24 bytes. */
+struct nt_file_standard_information {
+	__s64	allocation_size;	/* AllocationSize */
+	__s64	end_of_file;		/* EndOfFile: the file size */
+	__u32	number_of_links;	/* NumberOfLinks */
+	__u8	delete_pending;		/* DeletePending */
+	__u8	directory;		/* Directory */
+	__u16	__pad;
+};
+
+/*
+ * NtReadFile/NtWriteFile ByteOffset sentinels.  A LARGE_INTEGER whose value
+ * is FILE_USE_FILE_POINTER_POSITION means "use the handle's current
+ * position" rather than an explicit offset; FILE_WRITE_TO_END_OF_FILE means
+ * "append", and is only meaningful to a write.
+ */
+#define NT_FILE_USE_FILE_POINTER_POSITION	0xfffffffffffffffeULL
+#define NT_FILE_WRITE_TO_END_OF_FILE		0xffffffffffffffffULL
+
+/*
  * ---------------------------------------------------------------------
  * prctl() personality control
  * ---------------------------------------------------------------------

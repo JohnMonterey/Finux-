@@ -2,6 +2,7 @@
 config NT_FS_PERSONALITY
 	bool "NT filesystem personality (EXPERIMENTAL)"
 	select UNICODE
+	select NLS
 	help
 	  Give the kernel a first-class notion of an NT-style filesystem
 	  namespace: volumes with drive letters, NT device names, and an
@@ -36,6 +37,10 @@ config NT_FS_PERSONALITY_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Unit tests for the NT/Win32 pathname parser, the drive letter and
-	  volume registry, and the Win32 reserved-name rules.
+	  volume registry, the Win32 reserved-name rules, the file metadata
+	  layer, create/open with its dispositions and sharing, the Object
+	  Manager handle table, and the NT file system calls (create, open,
+	  read, write, close and query).  They run against a private tmpfs
+	  mount and need no special hardware.
 
 	  If unsure, say N.

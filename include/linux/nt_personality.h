@@ -34,6 +34,7 @@
 #include <uapi/linux/nt_personality.h>
 
 struct dentry;
+struct file;
 struct fs_struct;
 struct inode;
 struct seq_file;
@@ -497,6 +498,14 @@ struct nt_create_req {
 /**
  * struct nt_open - one open instance: the file object a create/open returns
  * @path:    the object; holds references to mount and dentry
+ * @file:    an open struct file on @path, or NULL.  This is what the NT read
+ *           and write calls act on: nt_create() opens it once, with flags
+ *           derived from the granted access (O_RDONLY/O_RDWR, O_DIRECTORY for
+ *           a directory), and nt_close() fput()s it.  It is NULL for the two
+ *           objects that carry no readable byte stream of their own: a named
+ *           stream handle (whose bytes live in an xattr and are reached
+ *           through @stream, not a file position) and an object whose inode
+ *           is neither a regular file nor a directory.
  * @volume:  volume the path was resolved through; holds a reference
  * @share:   per-inode share-control block this open is registered in
  * @node:    link in nt_share::opens
@@ -514,6 +523,7 @@ struct nt_create_req {
  */
 struct nt_open {
 	struct path		path;
+	struct file		*file;
 	struct nt_volume	*volume;
 	struct nt_share		*share;
 	struct list_head	node;
@@ -547,6 +557,62 @@ u32 nt_handle_alloc(struct nt_handle_table *ht, struct nt_open *open,
 u32 nt_handle_lookup(struct nt_handle_table *ht, u32 handle,
 		     struct nt_open **open);
 u32 nt_handle_close(struct nt_handle_table *ht, u32 handle);
+
+/* --- NT file system calls (fs/ntpers/syscall.c) --------------------- */
+
+/*
+ * The file calls are split into a *core* and a *wrapper*, the way
+ * fs/binfmt_pe.c split the pure pe_parse_headers() from the I/O-driving
+ * load_pe_binary().  The core functions below operate purely on in-kernel
+ * data - a decoded UTF-8 path, kernel buffers, a struct nt_task_ctx - and
+ * return an NTSTATUS.  They do the real work (nt_create(), the handle table,
+ * VFS read/write) and are what the KUnit suite exercises against a tmpfs
+ * fixture, no user memory involved.  The wrappers (NtCreateFile() and its
+ * kin) are the future syscall entry points; they marshal the NT ABI in and
+ * out of user memory and call these cores.
+ */
+u32 nt_file_create(struct nt_task_ctx *ctx, const char *name,
+		   const struct nt_create_req *req, bool forbid_dir,
+		   u32 *handle, u64 *information);
+u32 nt_file_read(struct nt_task_ctx *ctx, u32 handle, s64 offset,
+		 void *buf, u32 len, u32 *bytes_read);
+u32 nt_file_write(struct nt_task_ctx *ctx, u32 handle, s64 offset,
+		  const void *buf, u32 len, u32 *bytes_written);
+u32 nt_file_close(struct nt_task_ctx *ctx, u32 handle);
+u32 nt_file_query_information(struct nt_task_ctx *ctx, u32 handle,
+			      u32 info_class, void *buf, u32 len, u32 *out_len);
+
+/*
+ * Entry wrappers: the NT system service ABI, named for the services they
+ * implement so a later dispatch stage can bind a syscall number straight to
+ * each.  Wiring the `syscall` instruction to these is a separate agent's job;
+ * nothing calls them yet.  They copy the ABI structures in and out of user
+ * memory, convert the ObjectName UNICODE_STRING (UTF-16LE) to the UTF-8 path
+ * nt_create() expects, and drive the cores above.
+ */
+u32 NtCreateFile(u64 __user *file_handle, u32 desired_access,
+		 struct nt_object_attributes __user *object_attributes,
+		 struct nt_io_status_block __user *io_status_block,
+		 s64 __user *allocation_size, u32 file_attributes,
+		 u32 share_access, u32 create_disposition, u32 create_options,
+		 void __user *ea_buffer, u32 ea_length);
+u32 NtOpenFile(u64 __user *file_handle, u32 desired_access,
+	       struct nt_object_attributes __user *object_attributes,
+	       struct nt_io_status_block __user *io_status_block,
+	       u32 share_access, u32 open_options);
+u32 NtReadFile(u64 file_handle, u64 event, u64 apc_routine, u64 apc_context,
+	       struct nt_io_status_block __user *io_status_block,
+	       void __user *buffer, u32 length, s64 __user *byte_offset,
+	       u32 __user *key);
+u32 NtWriteFile(u64 file_handle, u64 event, u64 apc_routine, u64 apc_context,
+		struct nt_io_status_block __user *io_status_block,
+		const void __user *buffer, u32 length, s64 __user *byte_offset,
+		u32 __user *key);
+u32 NtClose(u64 handle);
+u32 NtQueryInformationFile(u64 file_handle,
+			   struct nt_io_status_block __user *io_status_block,
+			   void __user *file_information, u32 length,
+			   u32 info_class);
 
 /* --- share / delete semantics (fs/ntpers/share.c) -------------------- */
 

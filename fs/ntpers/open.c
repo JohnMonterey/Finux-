@@ -38,7 +38,9 @@
  * table; nt_close() releases both and performs a pending delete.
  */
 
+#include <linux/cred.h>
 #include <linux/dcache.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/namei.h>
 #include <linux/slab.h>
@@ -303,6 +305,53 @@ static int nt_check_access(const struct path *path, u32 access)
 				mask);
 }
 
+/*
+ * Open the struct file the NT read and write calls act on.
+ *
+ * nt_create() returns a file object, and NtReadFile / NtWriteFile need a real
+ * open struct file to move bytes through, so it is opened once here at create
+ * time rather than lazily on first I/O - an open that will fail (a directory
+ * asked for write access, say) should fail the create, not a later read.  The
+ * flags follow the granted access: a directory opens read-only with
+ * O_DIRECTORY, as there is no data stream to write; a regular file opens
+ * O_RDWR when any write right was granted and O_RDONLY otherwise.
+ *
+ * An object that is neither a regular file nor a directory - a device node, a
+ * fifo, or a reparse point opened without following it - carries no readable
+ * byte stream, so no file is opened (handle->file stays NULL) and the read
+ * and write calls refuse it.  This is deliberate: blindly opening a fifo
+ * would block waiting for a peer.
+ *
+ * Returns 0, having set handle->file (possibly to NULL), or a negative errno.
+ */
+static int nt_open_file_object(struct nt_open *handle)
+{
+	struct inode *inode = d_inode(handle->path.dentry);
+	struct file *file;
+	int flags;
+
+	if (S_ISDIR(inode->i_mode)) {
+		flags = O_RDONLY | O_DIRECTORY | O_LARGEFILE;
+	} else if (S_ISREG(inode->i_mode)) {
+		bool write = handle->access & (NT_ACCESS_GENERIC_ALL |
+					       NT_ACCESS_GENERIC_WRITE |
+					       NT_ACCESS_FILE_WRITE_DATA |
+					       NT_ACCESS_FILE_APPEND_DATA);
+
+		flags = (write ? O_RDWR : O_RDONLY) | O_LARGEFILE;
+	} else {
+		handle->file = NULL;
+		return 0;
+	}
+
+	file = dentry_open(&handle->path, flags, current_cred());
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	handle->file = file;
+	return 0;
+}
+
 /* Unlink (or rmdir) the object a delete-on-close handle held. */
 static void nt_unlink_handle(struct nt_open *open)
 {
@@ -341,6 +390,18 @@ void nt_close(struct nt_open *handle)
 		return;
 
 	unlink = nt_share_close(handle);
+
+	/*
+	 * Drop this handle's own open file object before any pending delete.
+	 * The file is an internal reference taken by nt_create(); releasing it
+	 * first means the delete-on-close unlink below is not operating on a
+	 * file still held open from within this same handle.  fput() is safe
+	 * here even from a kthread - it defers the final close - and unlinking
+	 * an open file is well defined, so the ordering is a tidiness choice,
+	 * not a correctness one.
+	 */
+	if (handle->file)
+		fput(handle->file);
 
 	if (handle->stream) {
 		/*
@@ -646,6 +707,28 @@ int nt_create(struct nt_task_ctx *ctx, const char *name,
 				       (req->attributes &
 					NT_FILE_ATTRIBUTE_SETTABLE) |
 				       NT_FILE_ATTRIBUTE_ARCHIVE);
+	}
+
+	/*
+	 * Open the file object last, once the create, the share check and any
+	 * truncation have all succeeded, so it exists only for an open that is
+	 * fully granted - the order IoCreateFile uses.
+	 */
+	err = nt_open_file_object(handle);
+	if (err) {
+		/*
+		 * The open failed after the handle was registered in the share
+		 * table.  Deregister it, but do not let delete-on-close fire:
+		 * like the sharing-conflict path above, a create that fails at
+		 * this last step leaves the file as it found it rather than
+		 * unlinking one a racing opener may now hold.  handle->file is
+		 * NULL on this path, so there is nothing to fput.
+		 */
+		nt_share_close(handle);
+		path_put(&handle->path);
+		nt_volume_put(handle->volume);
+		kfree(handle);
+		goto out_free;
 	}
 
 	out->handle = handle;
