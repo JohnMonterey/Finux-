@@ -186,6 +186,46 @@ static inline struct dentry *nt_test_create(struct kunit *test,
 	return child;
 }
 
+/**
+ * nt_test_symlink - create a symlink with an exact name and target
+ * @test:   the test
+ * @fs:     fixture state
+ * @parent: directory to create in
+ * @name:   the link's name
+ * @target: what it points at, as stored
+ *
+ * Returns a dentry owned by the fixture, or an ERR_PTR.  Do not dput it.
+ */
+static inline struct dentry *nt_test_symlink(struct kunit *test,
+					     struct nt_test_fs *fs,
+					     struct dentry *parent,
+					     const char *name,
+					     const char *target)
+{
+	struct qstr q = QSTR_INIT(name, strlen(name));
+	struct dentry *child;
+	int err;
+
+	KUNIT_ASSERT_LT_MSG(test, fs->nr_tracked,
+			    (unsigned int)NT_TEST_MAX_DENTRIES,
+			    "raise NT_TEST_MAX_DENTRIES");
+
+	child = start_creating_noperm(parent, &q);
+	if (IS_ERR(child))
+		return child;
+
+	err = vfs_symlink(&nop_mnt_idmap, d_inode(parent), child, target,
+			  NULL);
+	if (err) {
+		end_creating(child);
+		return ERR_PTR(err);
+	}
+	child = end_creating_keep(child);
+
+	fs->tracked[fs->nr_tracked++] = child;
+	return child;
+}
+
 /* Build a struct path for a dentry on the fixture's mount. */
 static inline void nt_test_path(struct nt_test_fs *fs, struct dentry *dentry,
 				struct path *out)

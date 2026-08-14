@@ -178,6 +178,7 @@ static int nt_resolve_start(struct nt_task_ctx *ctx,
  *   - It does not follow symlinks in the middle of a path.  A component
  *     that turns out to be a symlink stops the walk with -ELOOP rather
  *     than silently resolving to something the caller did not ask for.
+ *     A symlink as the *final* component is handled: see below.
  *
  * Both are limitations of this fallback, not of the architecture: on a
  * volume with casefolding enabled, nt_path_resolve() never calls this and
@@ -237,11 +238,52 @@ static int nt_walk_ci(const struct path *start, const char *rel,
 			}
 		}
 
-		if (!last || (flags & NT_RESOLVE_FOLLOW)) {
-			if (d_is_symlink(next.dentry)) {
+		if (d_is_symlink(next.dentry)) {
+			if (!last) {
+				/* The mid-path limitation described above. */
 				path_put(&next);
 				err = -ELOOP;
 				break;
+			}
+
+			/*
+			 * A symlink as the last component.  Without
+			 * NT_RESOLVE_FOLLOW the caller asked for the link
+			 * itself, which is what NT does when a create
+			 * carries FILE_OPEN_REPARSE_POINT, so hand it back
+			 * untouched.
+			 *
+			 * With NT_RESOLVE_FOLLOW, resolve it - but let the
+			 * VFS do it.  Following a symlink correctly means
+			 * loop counting, nesting limits, absolute versus
+			 * relative targets and mount crossing, and there is
+			 * no version of reimplementing that here which is
+			 * better than calling the code that already exists.
+			 *
+			 * nt_ci_lookup() has told us the real on-disk
+			 * spelling of the component, so the lookup below
+			 * needs no case folding of its own.  The link
+			 * *target* resolves case-sensitively, which is
+			 * correct: it is a Linux path stored in a
+			 * filesystem that does not fold case.
+			 */
+			if (flags & NT_RESOLVE_FOLLOW) {
+				struct name_snapshot real;
+				unsigned int lflags = LOOKUP_FOLLOW;
+				struct path target;
+
+				if (want_dir)
+					lflags |= LOOKUP_DIRECTORY;
+
+				take_dentry_name_snapshot(&real, next.dentry);
+				err = vfs_path_lookup(cur.dentry, cur.mnt,
+						      real.name.name, lflags,
+						      &target);
+				release_dentry_name_snapshot(&real);
+				path_put(&next);
+				if (err)
+					break;
+				next = target;
 			}
 		}
 
@@ -281,6 +323,7 @@ int nt_path_resolve(struct nt_task_ctx *ctx, const struct nt_path_parse *p,
 	const char *rel;
 	unsigned int rel_len;
 	char *parent_rel = NULL;
+	bool want_ci;
 	int err;
 
 	if (!p || !out || p->type == NT_PATH_INVALID)
@@ -349,20 +392,38 @@ int nt_path_resolve(struct nt_task_ctx *ctx, const struct nt_path_parse *p,
 	if (flags & NT_RESOLVE_DIRECTORY)
 		lookup_flags |= LOOKUP_DIRECTORY;
 
+	want_ci = flags & NT_RESOLVE_CASE_INSENSITIVE;
+
 	/*
 	 * Fast path: either the caller wants case-sensitive resolution, or
-	 * the volume's backing filesystem folds case by itself.  Either
-	 * way the ordinary VFS walk produces the right answer, so use it
-	 * and get RCU pathwalk, symlinks and mount crossing for free.
+	 * the backing filesystem folds case by itself.  Either way the
+	 * ordinary VFS walk produces the right answer, so use it and get
+	 * RCU pathwalk, symlinks and mount crossing for free.
 	 */
-	if (!(flags & NT_RESOLVE_CASE_INSENSITIVE) ||
+	if (!want_ci ||
 	    (vol && (vol->flags & NT_VOL_NATIVE_CI)) ||
 	    nt_dir_is_native_ci(start.dentry)) {
 		err = vfs_path_lookup(start.dentry, start.mnt, rel,
 				      lookup_flags, &result);
-		if (err)
+		if (!err)
+			goto done;
+
+		/*
+		 * Casefolding in Linux is a property of each directory,
+		 * not of the filesystem.  NT_VOL_NATIVE_CI was decided
+		 * once, from the volume root, and a tree can be mixed: a
+		 * casefolded root can contain a directory that predates
+		 * the +F flag, or one it was never set on.
+		 *
+		 * So a fast-path -ENOENT is not proof the name is absent -
+		 * it may only mean some directory along the way does not
+		 * fold.  Retry with the folding walk below before telling a
+		 * Windows caller the file does not exist.  Any other error
+		 * is real, and a case-sensitive caller has nothing to
+		 * retry.
+		 */
+		if (!want_ci || err != -ENOENT)
 			goto out_put;
-		goto done;
 	}
 
 	err = nt_walk_ci(&start, rel, rel_len, flags, &result);
