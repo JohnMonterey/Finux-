@@ -40,13 +40,18 @@
 #define PE_F_EXECUTABLE_IMAGE		0x0002
 #define PE_SUBSYSTEM_WINDOWS_CUI	3
 #define PE_SCN_CNT_CODE			0x00000020
+#define PE_SCN_CNT_INITIALIZED_DATA	0x00000040
 #define PE_SCN_MEM_EXECUTE		0x20000000
 #define PE_SCN_MEM_READ			0x40000000
+#define PE_SCN_MEM_WRITE		0x80000000
 
 #define PE_PAGE		0x1000UL
 #define PE_HDR_OFF	0x80		/* where we place the PE header */
 #define PE_IMAGE_BASE	0x140000000UL	/* default 64-bit EXE base */
 #define PE_IMAGE_SIZE	(2 * PE_PAGE)	/* one header page + one text page */
+
+/* A low preferred base the relocatable test image is unlikely to keep. */
+#define PE_RELOC_BASE	0x10000UL
 
 struct __attribute__((packed)) pe_file_hdr {
 	uint32_t magic;
@@ -116,6 +121,48 @@ static const uint8_t pe_entry_code[] = {
 	0x0f, 0x05,
 };
 
+/*
+ * x86-64 entry payload that checks its own base relocation.  It reads a
+ * pointer that .reloc fixes up (stored at RVA 0x2000, initially base+0x2000)
+ * and confirms the loader made it equal to (actual load base) + 0x2000.  It
+ * exits 42 when the image was relocated and the fixup is right, 43 when the
+ * image loaded at its preferred base (also right), and 1 when the fixup is
+ * wrong.  Assembled from:
+ *
+ *   lea  rbx, [rip - 7]        ; rbx = &_start = base + 0x1000
+ *   sub  rbx, 0x1000           ; rbx = actual load base
+ *   mov  rax, [rbx + 0x2000]   ; rax = the relocated pointer
+ *   lea  rcx, [rbx + 0x2000]   ; rcx = base + 0x2000 (expected)
+ *   cmp  rax, rcx
+ *   jne  fail
+ *   mov  rcx, 0x10000          ; preferred ImageBase
+ *   cmp  rbx, rcx
+ *   je   preferred
+ *   mov  edi, 42
+ *   jmp  done
+ *   preferred: mov edi, 43; jmp done
+ *   fail:      mov edi, 1
+ *   done:      mov eax, 60; syscall
+ */
+static const uint8_t pe_reloc_code[] = {
+	0x48, 0x8d, 0x1d, 0xf9, 0xff, 0xff, 0xff,	/* lea rbx,[rip-7]   */
+	0x48, 0x81, 0xeb, 0x00, 0x10, 0x00, 0x00,	/* sub rbx,0x1000    */
+	0x48, 0x8b, 0x83, 0x00, 0x20, 0x00, 0x00,	/* mov rax,[rbx+0x2000] */
+	0x48, 0x8d, 0x8b, 0x00, 0x20, 0x00, 0x00,	/* lea rcx,[rbx+0x2000] */
+	0x48, 0x39, 0xc8,				/* cmp rax,rcx	     */
+	0x75, 0x1a,					/* jne fail	     */
+	0x48, 0xc7, 0xc1, 0x00, 0x00, 0x01, 0x00,	/* mov rcx,0x10000   */
+	0x48, 0x39, 0xcb,				/* cmp rbx,rcx	     */
+	0x74, 0x07,					/* je preferred	     */
+	0xbf, 0x2a, 0x00, 0x00, 0x00,			/* mov edi,42	     */
+	0xeb, 0x0c,					/* jmp done	     */
+	0xbf, 0x2b, 0x00, 0x00, 0x00,			/* mov edi,43	     */
+	0xeb, 0x05,					/* jmp done	     */
+	0xbf, 0x01, 0x00, 0x00, 0x00,			/* mov edi,1	     */
+	0xb8, 0x3c, 0x00, 0x00, 0x00,			/* mov eax,60	     */
+	0x0f, 0x05,					/* syscall	     */
+};
+
 /* Lay out a complete, loadable PE image into @img (PE_IMAGE_SIZE bytes). */
 static void build_pe_image(uint8_t *img)
 {
@@ -164,47 +211,249 @@ static void build_pe_image(uint8_t *img)
 	memcpy(img + PE_PAGE, pe_entry_code, sizeof(pe_entry_code));
 }
 
-TEST(load_and_run_pe)
+/*
+ * A PE built with the old 512-byte file alignment, so its .text does not
+ * start on a page boundary and the loader has to copy it in rather than map
+ * it from the file.  It exits 42.  Not relocatable; loads at its preferred
+ * base.  The whole file is one page: headers in the first 0x400 bytes, the
+ * code at file offset 0x400 (512-aligned, not page-aligned).
+ */
+#define PE_COPYIN_FILE_ALIGN	0x200
+#define PE_COPYIN_HDR_SIZE	0x400
+#define PE_COPYIN_TEXT_OFF	0x400
+#define PE_COPYIN_FILE_SIZE	PE_PAGE
+#define PE_COPYIN_IMAGE_SIZE	(2 * PE_PAGE)
+
+static void build_pe_copyin(uint8_t *img)
+{
+	struct pe_file_hdr *pe;
+	struct pe_opt64 *opt;
+	struct pe_section *sec;
+	uint16_t opt_size = sizeof(*opt) + 16 * 8;
+
+	memset(img, 0, PE_COPYIN_FILE_SIZE);
+	img[0] = 'M';
+	img[1] = 'Z';
+	*(uint32_t *)(img + 0x3c) = PE_HDR_OFF;
+
+	pe = (struct pe_file_hdr *)(img + PE_HDR_OFF);
+	pe->magic = PE_NT_MAGIC;
+	pe->machine = PE_MACHINE_AMD64;
+	pe->sections = 1;
+	pe->opt_hdr_size = opt_size;
+	pe->flags = PE_F_EXECUTABLE_IMAGE | PE_F_RELOCS_STRIPPED;
+
+	opt = (struct pe_opt64 *)(img + PE_HDR_OFF + sizeof(*pe));
+	opt->magic = PE_OPT_MAGIC_PLUS;
+	opt->entry_point = PE_PAGE;
+	opt->code_base = PE_PAGE;
+	opt->image_base = PE_IMAGE_BASE;
+	opt->section_align = PE_PAGE;
+	opt->file_align = PE_COPYIN_FILE_ALIGN;
+	opt->sub_major = 6;
+	opt->image_size = PE_COPYIN_IMAGE_SIZE;
+	opt->header_size = PE_COPYIN_HDR_SIZE;
+	opt->subsys = PE_SUBSYSTEM_WINDOWS_CUI;
+	opt->stack_reserve = 0x100000;
+	opt->stack_commit = 0x1000;
+	opt->data_dirs = 16;
+
+	sec = (struct pe_section *)(img + PE_HDR_OFF + sizeof(*pe) + opt_size);
+	memcpy(sec->name, ".text", 5);
+	sec->virtual_size = sizeof(pe_entry_code);
+	sec->virtual_address = PE_PAGE;
+	sec->raw_size = PE_COPYIN_FILE_ALIGN;
+	sec->raw_ptr = PE_COPYIN_TEXT_OFF;
+	sec->flags = PE_SCN_CNT_CODE | PE_SCN_MEM_EXECUTE | PE_SCN_MEM_READ;
+
+	memcpy(img + PE_COPYIN_TEXT_OFF, pe_entry_code, sizeof(pe_entry_code));
+}
+
+/*
+ * A relocatable PE: three sections (.text, .data, .reloc) and a base
+ * relocation table with one DIR64 fixup.  .data holds a pointer to itself
+ * (base+0x2000) that the fixup adjusts; the payload checks the adjustment.
+ * Its file image is four pages, all page-aligned, so the sections are
+ * file-backed and the exercise is purely relocation.
+ */
+#define PE_RELOC_IMAGE_SIZE	(4 * PE_PAGE)
+
+static void build_pe_reloc(uint8_t *img)
+{
+	struct pe_file_hdr *pe;
+	struct pe_opt64 *opt;
+	struct pe_section *sec;
+	uint8_t *dirs, *reloc;
+	uint16_t opt_size = sizeof(*opt) + 16 * 8;
+
+	memset(img, 0, PE_RELOC_IMAGE_SIZE);
+	img[0] = 'M';
+	img[1] = 'Z';
+	*(uint32_t *)(img + 0x3c) = PE_HDR_OFF;
+
+	pe = (struct pe_file_hdr *)(img + PE_HDR_OFF);
+	pe->magic = PE_NT_MAGIC;
+	pe->machine = PE_MACHINE_AMD64;
+	pe->sections = 3;
+	pe->opt_hdr_size = opt_size;
+	pe->flags = PE_F_EXECUTABLE_IMAGE;	/* relocations present */
+
+	opt = (struct pe_opt64 *)(img + PE_HDR_OFF + sizeof(*pe));
+	opt->magic = PE_OPT_MAGIC_PLUS;
+	opt->entry_point = PE_PAGE;
+	opt->code_base = PE_PAGE;
+	opt->image_base = PE_RELOC_BASE;
+	opt->section_align = PE_PAGE;
+	opt->file_align = PE_PAGE;
+	opt->sub_major = 6;
+	opt->image_size = PE_RELOC_IMAGE_SIZE;
+	opt->header_size = PE_PAGE;
+	opt->subsys = PE_SUBSYSTEM_WINDOWS_CUI;
+	opt->stack_reserve = 0x100000;
+	opt->stack_commit = 0x1000;
+	opt->data_dirs = 16;
+
+	/* Data directory [5] is the base relocation table. */
+	dirs = (uint8_t *)opt + sizeof(*opt);
+	*(uint32_t *)(dirs + 5 * 8 + 0) = 3 * PE_PAGE;	/* .reloc RVA */
+	*(uint32_t *)(dirs + 5 * 8 + 4) = 10;		/* one block */
+
+	sec = (struct pe_section *)(img + PE_HDR_OFF + sizeof(*pe) + opt_size);
+	memcpy(sec[0].name, ".text", 5);
+	sec[0].virtual_size = sizeof(pe_reloc_code);
+	sec[0].virtual_address = PE_PAGE;
+	sec[0].raw_size = PE_PAGE;
+	sec[0].raw_ptr = PE_PAGE;
+	sec[0].flags = PE_SCN_CNT_CODE | PE_SCN_MEM_EXECUTE | PE_SCN_MEM_READ;
+
+	memcpy(sec[1].name, ".data", 5);
+	sec[1].virtual_size = 8;
+	sec[1].virtual_address = 2 * PE_PAGE;
+	sec[1].raw_size = PE_PAGE;
+	sec[1].raw_ptr = 2 * PE_PAGE;
+	sec[1].flags = PE_SCN_CNT_INITIALIZED_DATA | PE_SCN_MEM_READ |
+		       PE_SCN_MEM_WRITE;
+
+	memcpy(sec[2].name, ".reloc", 6);
+	sec[2].virtual_size = 10;
+	sec[2].virtual_address = 3 * PE_PAGE;
+	sec[2].raw_size = PE_PAGE;
+	sec[2].raw_ptr = 3 * PE_PAGE;
+	sec[2].flags = PE_SCN_CNT_INITIALIZED_DATA | PE_SCN_MEM_READ;
+
+	memcpy(img + PE_PAGE, pe_reloc_code, sizeof(pe_reloc_code));
+
+	/* .data: pointer to itself, before relocation. */
+	*(uint64_t *)(img + 2 * PE_PAGE) = PE_RELOC_BASE + 2 * PE_PAGE;
+
+	/* .reloc: one block, one DIR64 fixup of the pointer at RVA 0x2000. */
+	reloc = img + 3 * PE_PAGE;
+	*(uint32_t *)(reloc + 0) = 2 * PE_PAGE;		/* page RVA */
+	*(uint32_t *)(reloc + 4) = 10;			/* block size */
+	*(uint16_t *)(reloc + 8) = (10 << 12) | 0;	/* DIR64, offset 0 */
+}
+
+/*
+ * Write @img to a temp file, execve() it, and return the child's exit
+ * status - or a negative value for a harness-level failure (so a broken
+ * test setup is not mistaken for a loader result).  Exit code 100 means the
+ * kernel has no PE loader (execve gave ENOEXEC); 101 means execve failed for
+ * some other reason.
+ */
+static int exec_pe(const uint8_t *img, size_t len)
 {
 	char path[] = "/tmp/binfmt_pe_test.XXXXXX";
-	uint8_t img[PE_IMAGE_SIZE];
 	int fd, status;
 	pid_t pid;
 
-	build_pe_image(img);
-
 	fd = mkstemp(path);
-	ASSERT_GE(fd, 0);
-	ASSERT_EQ(write(fd, img, PE_IMAGE_SIZE), (ssize_t)PE_IMAGE_SIZE);
-	ASSERT_EQ(fchmod(fd, 0755), 0);
-	ASSERT_EQ(close(fd), 0);
+	if (fd < 0)
+		return -1;
+	if (write(fd, img, len) != (ssize_t)len || fchmod(fd, 0755) ||
+	    close(fd)) {
+		unlink(path);
+		return -1;
+	}
 
 	pid = fork();
-	ASSERT_GE(pid, 0);
+	if (pid < 0) {
+		unlink(path);
+		return -1;
+	}
 	if (pid == 0) {
 		char *argv[] = { path, NULL };
 		char *envp[] = { NULL };
 
 		execve(path, argv, envp);
-		/*
-		 * ENOEXEC here means the kernel has no PE loader; any other
-		 * errno is a real exec failure.  Encode the two apart so the
-		 * parent can skip vs. fail.
-		 */
 		_exit(errno == ENOEXEC ? 100 : 101);
 	}
 
-	ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	if (waitpid(pid, &status, 0) != pid) {
+		unlink(path);
+		return -1;
+	}
 	unlink(path);
 
-	ASSERT_TRUE(WIFEXITED(status));
-	if (WEXITSTATUS(status) == 100)
-		SKIP(return, "kernel built without CONFIG_BINFMT_PE");
-	if (WEXITSTATUS(status) == 101)
-		SKIP(return, "execve failed for a reason other than ENOEXEC");
+	if (!WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status);
+}
 
-	/* The PE's entry point ran and exited 42. */
-	EXPECT_EQ(WEXITSTATUS(status), 42);
+/* A plain page-aligned PE, mapped from the file, runs and exits 42. */
+TEST(load_and_run_pe)
+{
+	uint8_t img[PE_IMAGE_SIZE];
+	int rc;
+
+	build_pe_image(img);
+	rc = exec_pe(img, PE_IMAGE_SIZE);
+
+	ASSERT_GE(rc, 0);
+	if (rc == 100)
+		SKIP(return, "kernel built without CONFIG_BINFMT_PE");
+	if (rc == 101)
+		SKIP(return, "execve failed for a reason other than ENOEXEC");
+	EXPECT_EQ(rc, 42);
+}
+
+/* A 512-byte-file-aligned PE exercises the copy-in path and exits 42. */
+TEST(load_and_run_pe_copyin)
+{
+	uint8_t img[PE_COPYIN_FILE_SIZE];
+	int rc;
+
+	build_pe_copyin(img);
+	rc = exec_pe(img, PE_COPYIN_FILE_SIZE);
+
+	ASSERT_GE(rc, 0);
+	if (rc == 100)
+		SKIP(return, "kernel built without CONFIG_BINFMT_PE");
+	if (rc == 101)
+		SKIP(return, "execve failed for a reason other than ENOEXEC");
+	EXPECT_EQ(rc, 42);
+}
+
+/*
+ * A relocatable PE.  Under address-space randomisation the loader places it
+ * at a non-preferred base and applies its DIR64 relocation; the payload
+ * confirms the fixup (exit 42).  If it happens to load at its preferred base
+ * the payload still confirms correctness (exit 43) - both are a pass.
+ */
+TEST(load_and_run_pe_reloc)
+{
+	uint8_t img[PE_RELOC_IMAGE_SIZE];
+	int rc;
+
+	build_pe_reloc(img);
+	rc = exec_pe(img, PE_RELOC_IMAGE_SIZE);
+
+	ASSERT_GE(rc, 0);
+	if (rc == 100)
+		SKIP(return, "kernel built without CONFIG_BINFMT_PE");
+	if (rc == 101)
+		SKIP(return, "execve failed for a reason other than ENOEXEC");
+	ASSERT_NE(rc, 1);	/* relocation applied incorrectly */
+	EXPECT_TRUE(rc == 42 || rc == 43);
 }
 
 TEST_HARNESS_MAIN

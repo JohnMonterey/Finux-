@@ -211,15 +211,43 @@ static void pe_parse_bad_alignment_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pe_parse_headers(mz, sizeof(mz), &pe, &opt, &pi),
 			-ENOEXEC);
 
-	/*
-	 * Sub-page on-disk file alignment - a valid PE, but one that needs
-	 * the copy-in path this loader does not have yet, so it is refused
-	 * rather than mapped wrongly.
-	 */
+	/* File alignment below the PE minimum of 512. */
 	pe_make_valid(mz, &pe, &opt);
-	opt.file_align = 0x200;
+	opt.file_align = 256;
 	KUNIT_EXPECT_EQ(test, pe_parse_headers(mz, sizeof(mz), &pe, &opt, &pi),
 			-ENOEXEC);
+
+	/* File alignment that is not a power of two. */
+	pe_make_valid(mz, &pe, &opt);
+	opt.file_align = 0x600;
+	KUNIT_EXPECT_EQ(test, pe_parse_headers(mz, sizeof(mz), &pe, &opt, &pi),
+			-ENOEXEC);
+
+	/* Section alignment smaller than file alignment (PE forbids this). */
+	pe_make_valid(mz, &pe, &opt);
+	opt.section_align = 0x1000;
+	opt.file_align = 0x10000;
+	KUNIT_EXPECT_EQ(test, pe_parse_headers(mz, sizeof(mz), &pe, &opt, &pi),
+			-ENOEXEC);
+}
+
+static void pe_parse_subpage_file_align_test(struct kunit *test)
+{
+	char mz[BINPRM_BUF_SIZE];
+	struct pe_hdr pe;
+	struct pe32plus_opt_hdr opt;
+	struct pe_load_info pi;
+
+	/*
+	 * The old 512-byte file alignment with page section alignment is a
+	 * perfectly valid PE; the loader accepts it and copies such sections
+	 * in rather than mapping them from the file.
+	 */
+	pe_make_valid(mz, &pe, &opt);
+	opt.file_align = 512;
+	opt.section_align = 0x1000;
+	KUNIT_EXPECT_EQ(test, pe_parse_headers(mz, sizeof(mz), &pe, &opt, &pi), 0);
+	KUNIT_EXPECT_EQ(test, pi.file_align, 512);
 }
 
 static void pe_parse_bad_image_base_test(struct kunit *test)
@@ -327,6 +355,7 @@ static struct kunit_case binfmt_pe_test_cases[] = {
 	KUNIT_CASE(pe_parse_opt_hdr_too_small_test),
 	KUNIT_CASE(pe_parse_section_count_test),
 	KUNIT_CASE(pe_parse_bad_alignment_test),
+	KUNIT_CASE(pe_parse_subpage_file_align_test),
 	KUNIT_CASE(pe_parse_bad_image_base_test),
 	KUNIT_CASE(pe_parse_bad_image_size_test),
 	KUNIT_CASE(pe_parse_bad_entry_test),

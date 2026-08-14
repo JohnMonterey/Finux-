@@ -46,8 +46,10 @@
 #include <linux/ptrace.h>
 #include <linux/sched/task_stack.h>
 #include <linux/slab.h>
+#include <linux/log2.h>
 #include <linux/pe.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 
 /*
  * Bounds we impose on a PE image.  These are sanity limits, not format
@@ -63,6 +65,19 @@
 #define PE_MAX_SECTIONS		96
 #define PE_MAX_IMAGE_SIZE	(1UL << 31)	/* 2 GiB */
 #define PE_MAX_DATA_DIRS	16
+#define PE_MIN_FILE_ALIGN	512		/* smallest FileAlignment PE allows */
+#define PE_MAX_FILE_ALIGN	65536		/* largest FileAlignment PE allows */
+
+/* Data directory index of the base relocation table. */
+#define PE_DIR_BASERELOC	5
+
+/*
+ * Base relocation types.  For AMD64 only two ever occur: ABSOLUTE, which is
+ * padding and does nothing, and DIR64, a 64-bit fixup.  Anything else in an
+ * AMD64 image is unexpected and refused.
+ */
+#define PE_REL_ABSOLUTE		0
+#define PE_REL_DIR64		10
 
 /*
  * The validated, digested form of a PE header.  Everything the mapping
@@ -79,7 +94,10 @@ struct pe_load_info {
 	u32 section_align;		/* in-memory section alignment */
 	u32 file_align;			/* on-disk section alignment */
 	u16 nsections;
+	bool relocs_stripped;		/* image carries no base relocations */
 	loff_t section_table;		/* file offset of the section table */
+	u32 reloc_rva;			/* base relocation table, relative to base */
+	u32 reloc_size;			/* its size in bytes (0 if none) */
 };
 
 static int load_pe_binary(struct linux_binprm *bprm);
@@ -179,14 +197,19 @@ static int pe_parse_headers(const void *mz, size_t mz_len,
 	/*
 	 * Alignment.  The in-memory section alignment has to be a whole
 	 * number of pages so that each section lands on its own page with
-	 * its own protection.  This loader maps sections straight from the
-	 * file, so it also needs the on-disk alignment to be page-aligned;
-	 * an image built with a sub-page file alignment (the old 512-byte
-	 * default) needs the copy-in-from-file path, which is future work.
+	 * its own protection.  The on-disk file alignment is only bounded by
+	 * what PE itself allows: a section whose file data happens to start
+	 * on a page boundary is mapped straight from the file; one that does
+	 * not (the old 512-byte alignment) is copied in instead, so both are
+	 * fine here.  PE also requires the memory alignment to be at least
+	 * the file alignment.
 	 */
 	if (section_align < PAGE_SIZE || !IS_ALIGNED(section_align, PAGE_SIZE))
 		return -ENOEXEC;
-	if (file_align < PAGE_SIZE || !IS_ALIGNED(file_align, PAGE_SIZE))
+	if (file_align < PE_MIN_FILE_ALIGN || file_align > PE_MAX_FILE_ALIGN ||
+	    !is_power_of_2(file_align))
+		return -ENOEXEC;
+	if (section_align < file_align)
 		return -ENOEXEC;
 
 	/* The image must sit page-aligned in a sane, non-empty address range. */
@@ -223,7 +246,10 @@ static int pe_parse_headers(const void *mz, size_t mz_len,
 	out->section_align = section_align;
 	out->file_align = file_align;
 	out->nsections = nsections;
+	out->relocs_stripped = pe->flags & IMAGE_FILE_RELOCS_STRIPPED;
 	out->section_table = table;
+	out->reloc_rva = 0;
+	out->reloc_size = 0;
 	return 0;
 }
 
@@ -240,28 +266,86 @@ static int pe_read_exact(struct file *file, void *buf, size_t len, loff_t pos)
 }
 
 /*
- * Map one section into the new address space.
+ * Write into the image being loaded, even where the destination page is
+ * mapped read-only or execute-only.
  *
- * The section's file data is mapped straight from @file with the
- * protection the section asks for (this is why the caller has already
- * checked that both the section and file alignments are page multiples).
- * If the section is larger in memory than on disk - a .bss-style section,
- * or the zero-filled tail of .data - the difference is provided as
- * anonymous zero pages, and the partial last page of file data is zeroed
- * from its end to the page boundary.
+ * Two things need this: copying a section's file data into an
+ * anonymous mapping that already carries its final protection, and
+ * applying a base relocation to a fixup that may sit in read-only .text or
+ * .rdata.  FOLL_FORCE is the mechanism ptrace uses to poke read-only text;
+ * on a private mapping it breaks copy-on-write and leaves the page's
+ * protection unchanged, so the section stays W^X once the loader is done.
+ */
+static int pe_write_image(unsigned long uaddr, const void *buf, size_t len)
+{
+	int n = access_process_vm(current, uaddr, (void *)buf, len,
+				  FOLL_WRITE | FOLL_FORCE);
+
+	return (size_t)n == len ? 0 : -EFAULT;
+}
+
+/* Read @len bytes back out of the mapped image at @uaddr. */
+static int pe_read_image(unsigned long uaddr, void *buf, size_t len)
+{
+	int n = access_process_vm(current, uaddr, buf, len, 0);
+
+	return (size_t)n == len ? 0 : -EFAULT;
+}
+
+/*
+ * Copy @len bytes of @file at @off into the mapped image at @uaddr, through
+ * a page-sized bounce buffer.  Used for sections whose file data does not
+ * start on a page boundary and so cannot be mapped straight from the file.
+ */
+static int pe_copy_from_file(struct file *file, loff_t off,
+			     unsigned long uaddr, size_t len)
+{
+	void *page;
+	int err = 0;
+
+	page = (void *)__get_free_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	while (len) {
+		size_t chunk = min(len, PAGE_SIZE);
+		ssize_t n = kernel_read(file, page, chunk, &off);
+
+		if (n <= 0) {
+			err = n < 0 ? n : -ENOEXEC;
+			break;
+		}
+		err = pe_write_image(uaddr, page, n);
+		if (err)
+			break;
+		uaddr += n;
+		len -= n;
+	}
+
+	free_page((unsigned long)page);
+	return err;
+}
+
+/*
+ * Map one section into the new address space at @load_base.
+ *
+ * A section whose file data begins on a page boundary is mapped straight
+ * from the file with its final protection, copy-on-write - the cheap path.
+ * A section whose file data does not (an image built with the old 512-byte
+ * file alignment), or one with no file data at all (.bss), is backed by
+ * anonymous memory with its final protection and the file bytes are copied
+ * in.  Either way the in-memory tail beyond the file data is zero.
  */
 static int pe_map_section(struct file *file, const struct section_header *s,
-			  const struct pe_load_info *pi)
+			  const struct pe_load_info *pi, unsigned long load_base)
 {
-	unsigned long vaddr, vsize, filesz, mapped, prot, addr;
+	unsigned long vaddr, vsize, filesz, prot, addr;
 	unsigned long raw_off = s->data_addr;
 
 	/* A section with no in-memory footprint (SizeOfImage padding). */
 	vsize = s->virtual_size;
 	if (!vsize)
 		return 0;
-
-	vaddr = pi->image_base + s->virtual_address;
 
 	/* The section must lie page-aligned, wholly inside the image. */
 	if (!IS_ALIGNED((unsigned long)s->virtual_address, PAGE_SIZE))
@@ -270,15 +354,15 @@ static int pe_map_section(struct file *file, const struct section_header *s,
 	    vsize > pi->image_size - s->virtual_address)
 		return -ENOEXEC;
 
-	/* Only as many bytes as actually exist on disk are file-backed. */
-	filesz = min_t(unsigned long, s->raw_data_size, vsize);
+	vaddr = load_base + s->virtual_address;
 	prot = pe_section_prot(s->flags);
 
-	if (filesz && raw_off) {
-		if (!IS_ALIGNED(raw_off, PAGE_SIZE))
-			return -ENOEXEC;
+	/* File data exists only when there is a file pointer to it. */
+	filesz = raw_off ? min_t(unsigned long, s->raw_data_size, vsize) : 0;
 
-		mapped = PAGE_ALIGN(filesz);
+	if (filesz && IS_ALIGNED(raw_off, PAGE_SIZE)) {
+		unsigned long mapped = PAGE_ALIGN(filesz);
+
 		addr = vm_mmap(file, vaddr, mapped, prot,
 			       MAP_PRIVATE | MAP_FIXED, raw_off);
 		if (IS_ERR_VALUE(addr))
@@ -296,22 +380,115 @@ static int pe_map_section(struct file *file, const struct section_header *s,
 				       mapped - filesz))
 				return -EFAULT;
 		}
-	} else {
-		mapped = 0;
+
+		/* Anonymous zero pages for the in-memory tail (.bss). */
+		if (vsize > mapped) {
+			unsigned long bss = vaddr + mapped;
+			unsigned long len = PAGE_ALIGN(vaddr + vsize) - bss;
+
+			addr = vm_mmap(NULL, bss, len, prot,
+				       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0);
+			if (IS_ERR_VALUE(addr))
+				return (int)addr;
+		}
+		return 0;
 	}
 
-	/* Anonymous zero pages for the in-memory tail beyond the file data. */
-	if (vsize > mapped) {
-		unsigned long bss = vaddr + mapped;
-		unsigned long len = PAGE_ALIGN(vaddr + vsize) - bss;
+	/*
+	 * Copy-in path: back the whole section with anonymous zero memory at
+	 * its final protection, then copy the file data (if any) in.  The
+	 * FOLL_FORCE copy writes even into a read-only or exec-only section,
+	 * leaving its protection intact.
+	 */
+	addr = vm_mmap(NULL, vaddr, PAGE_ALIGN(vsize), prot,
+		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0);
+	if (IS_ERR_VALUE(addr))
+		return (int)addr;
 
-		addr = vm_mmap(NULL, bss, len, prot,
-			       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0);
-		if (IS_ERR_VALUE(addr))
-			return (int)addr;
-	}
+	if (filesz)
+		return pe_copy_from_file(file, raw_off, vaddr, filesz);
 
 	return 0;
+}
+
+/*
+ * Apply the base relocation table to an image that was loaded somewhere
+ * other than its preferred address.
+ *
+ * The table (the .reloc section) is a series of blocks, each fixing up one
+ * 4 KiB page: a header of the page's RVA and the block's byte length,
+ * followed by 16-bit entries of a 4-bit type and a 12-bit offset into the
+ * page.  For AMD64 the only meaningful type is DIR64 - add @delta to a
+ * 64-bit pointer - alongside ABSOLUTE padding entries that do nothing.
+ * Any other type is refused rather than misapplied.
+ *
+ * The table is read back out of the image we just mapped; each fixup is a
+ * read-modify-write through pe_read_image()/pe_write_image(), which reach
+ * even the read-only sections a relocation can legitimately land in.
+ */
+static int pe_apply_relocations(const struct pe_load_info *pi,
+				unsigned long load_base, unsigned long delta)
+{
+	unsigned char *table;
+	u32 pos = 0;
+	int err;
+
+	if (!pi->reloc_size)
+		return 0;
+
+	table = kvmalloc(pi->reloc_size, GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+
+	err = pe_read_image(load_base + pi->reloc_rva, table, pi->reloc_size);
+	if (err)
+		goto out;
+
+	while (pos + 8 <= pi->reloc_size) {
+		u32 page_rva = get_unaligned_le32(table + pos);
+		u32 block_size = get_unaligned_le32(table + pos + 4);
+		u32 nentries, i;
+
+		if (block_size < 8 || block_size > pi->reloc_size - pos) {
+			err = -ENOEXEC;
+			goto out;
+		}
+		if (page_rva >= pi->image_size) {
+			err = -ENOEXEC;
+			goto out;
+		}
+
+		nentries = (block_size - 8) / 2;
+		for (i = 0; i < nentries; i++) {
+			u16 e = get_unaligned_le16(table + pos + 8 + i * 2);
+			u32 type = e >> 12;
+			u32 rva = page_rva + (e & 0xfff);
+			u64 val;
+
+			if (type == PE_REL_ABSOLUTE)
+				continue;
+			if (type != PE_REL_DIR64) {
+				err = -ENOEXEC;
+				goto out;
+			}
+			if (rva > pi->image_size - sizeof(u64)) {
+				err = -ENOEXEC;
+				goto out;
+			}
+
+			err = pe_read_image(load_base + rva, &val, sizeof(val));
+			if (err)
+				goto out;
+			val += delta;
+			err = pe_write_image(load_base + rva, &val, sizeof(val));
+			if (err)
+				goto out;
+		}
+		pos += block_size;
+	}
+out:
+	kvfree(table);
+	return err;
 }
 
 static int load_pe_binary(struct linux_binprm *bprm)
@@ -323,7 +500,7 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	struct section_header *sections = NULL;
 	struct pt_regs *regs = current_pt_regs();
 	struct mm_struct *mm;
-	unsigned long reserve, sp;
+	unsigned long reserve, load_base, delta, sp;
 	u32 peaddr;
 	int retval, i;
 
@@ -350,6 +527,30 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	if (retval)
 		goto out;
 
+	/*
+	 * The base relocation table is one of the data directories that follow
+	 * the optional header.  Read its entry if the image has that many; it
+	 * decides whether an image that cannot get its preferred base can be
+	 * relocated or has to be refused.
+	 */
+	if (opt.data_dirs > PE_DIR_BASERELOC) {
+		struct data_dirent reloc_dd;
+		loff_t dd_off = (loff_t)peaddr + sizeof(pe) + sizeof(opt) +
+				PE_DIR_BASERELOC * sizeof(reloc_dd);
+
+		retval = pe_read_exact(file, &reloc_dd, sizeof(reloc_dd), dd_off);
+		if (retval)
+			goto out;
+		pi.reloc_rva = reloc_dd.virtual_address;
+		pi.reloc_size = reloc_dd.size;
+
+		retval = -ENOEXEC;
+		if (pi.reloc_size &&
+		    (pi.reloc_rva >= pi.image_size ||
+		     pi.reloc_size > pi.image_size - pi.reloc_rva))
+			goto out;
+	}
+
 	/* Slurp the section table now, while we can still fail cleanly. */
 	sections = kvmalloc_array(pi.nsections, sizeof(*sections), GFP_KERNEL);
 	if (!sections) {
@@ -372,6 +573,10 @@ static int load_pe_binary(struct linux_binprm *bprm)
 		goto out_free;
 
 	set_personality(PER_LINUX);
+	if (!(current->personality & ADDR_NO_RANDOMIZE) &&
+	    READ_ONCE(randomize_va_space))
+		current->flags |= PF_RANDOMIZE;
+
 	setup_new_exec(bprm);
 
 	/* Windows stacks are non-executable. */
@@ -380,26 +585,58 @@ static int load_pe_binary(struct linux_binprm *bprm)
 		goto out_free;
 
 	/*
-	 * Claim the whole image range at its preferred base up front.  This
-	 * both reserves the address space (so a later section mapping cannot
-	 * collide with an unrelated allocation) and, via MAP_FIXED_NOREPLACE,
-	 * tells us if the preferred base is unavailable.  This loader does not
-	 * yet apply base relocations, so an image that cannot load where it
-	 * wants is refused rather than loaded at the wrong address.
+	 * Choose where the image goes.
+	 *
+	 * An image that carries base relocations can run anywhere, so when
+	 * address-space randomisation is in effect it is loaded at a
+	 * kernel-chosen base and relocated to it, exactly as a PIE ELF is -
+	 * the preferred base is only a hint.  Otherwise the preferred base is
+	 * tried first with MAP_FIXED_NOREPLACE (which both reserves the whole
+	 * range so a later section mapping cannot collide with an unrelated
+	 * allocation, and reports whether the base is already taken); if it is
+	 * taken, a relocatable image falls back to a kernel-chosen base and a
+	 * non-relocatable one is refused rather than loaded at the wrong
+	 * address.
 	 */
-	reserve = vm_mmap(NULL, pi.image_base, pi.image_size, PROT_NONE,
-			  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, 0);
-	if (IS_ERR_VALUE(reserve) || reserve != pi.image_base) {
-		if (!IS_ERR_VALUE(reserve))
-			vm_munmap(reserve, pi.image_size);
-		retval = IS_ERR_VALUE(reserve) ? (int)reserve : -ENOMEM;
-		goto out_free;
+	if (!pi.relocs_stripped && pi.reloc_size &&
+	    (current->flags & PF_RANDOMIZE)) {
+		reserve = vm_mmap(NULL, 0, pi.image_size, PROT_NONE,
+				  MAP_PRIVATE | MAP_ANONYMOUS, 0);
+		if (IS_ERR_VALUE(reserve)) {
+			retval = (int)reserve;
+			goto out_free;
+		}
+		load_base = reserve;
+		delta = load_base - pi.image_base;
+	} else {
+		reserve = vm_mmap(NULL, pi.image_base, pi.image_size, PROT_NONE,
+				  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+				  0);
+		if (!IS_ERR_VALUE(reserve) && reserve == pi.image_base) {
+			load_base = pi.image_base;
+			delta = 0;
+		} else {
+			if (!IS_ERR_VALUE(reserve))
+				vm_munmap(reserve, pi.image_size);
+			if (pi.relocs_stripped || !pi.reloc_size) {
+				retval = -ENOMEM;
+				goto out_free;
+			}
+			reserve = vm_mmap(NULL, 0, pi.image_size, PROT_NONE,
+					  MAP_PRIVATE | MAP_ANONYMOUS, 0);
+			if (IS_ERR_VALUE(reserve)) {
+				retval = (int)reserve;
+				goto out_free;
+			}
+			load_base = reserve;
+			delta = load_base - pi.image_base;
+		}
 	}
 
-	/* Map the headers read-only at the image base, as Windows does. */
+	/* Map the headers read-only at the load base, as Windows does. */
 	if (pi.header_size) {
 		unsigned long hlen = PAGE_ALIGN(pi.header_size);
-		unsigned long addr = vm_mmap(file, pi.image_base, hlen, PROT_READ,
+		unsigned long addr = vm_mmap(file, load_base, hlen, PROT_READ,
 					     MAP_PRIVATE | MAP_FIXED, 0);
 
 		if (IS_ERR_VALUE(addr)) {
@@ -410,7 +647,14 @@ static int load_pe_binary(struct linux_binprm *bprm)
 
 	/* Map each section at its virtual address with its own protection. */
 	for (i = 0; i < pi.nsections; i++) {
-		retval = pe_map_section(file, &sections[i], &pi);
+		retval = pe_map_section(file, &sections[i], &pi, load_base);
+		if (retval)
+			goto out_free;
+	}
+
+	/* Fix up the image if it did not land at its preferred base. */
+	if (delta) {
+		retval = pe_apply_relocations(&pi, load_base, delta);
 		if (retval)
 			goto out_free;
 	}
@@ -420,12 +664,12 @@ static int load_pe_binary(struct linux_binprm *bprm)
 
 	/* Record the image layout for /proc, ps and core dumps. */
 	mm = current->mm;
-	mm->start_code = pi.image_base + pi.code_base;
-	mm->end_code = pi.image_base + pi.image_size;
-	mm->start_data = pi.image_base;
-	mm->end_data = pi.image_base + pi.image_size;
+	mm->start_code = load_base + pi.code_base;
+	mm->end_code = load_base + pi.image_size;
+	mm->start_data = load_base;
+	mm->end_data = load_base + pi.image_size;
 	mm->start_stack = bprm->p;
-	mm->start_brk = mm->brk = PAGE_ALIGN(pi.image_base + pi.image_size);
+	mm->start_brk = mm->brk = PAGE_ALIGN(load_base + pi.image_size);
 
 	set_binfmt(&pe_format);
 	finalize_exec(bprm);
@@ -437,7 +681,7 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	 * needs a valid, aligned stack, which is what it gets here.
 	 */
 	sp = bprm->p & ~15UL;
-	start_thread(regs, pi.image_base + pi.entry, sp);
+	start_thread(regs, load_base + pi.entry, sp);
 	return 0;
 
 out_free:

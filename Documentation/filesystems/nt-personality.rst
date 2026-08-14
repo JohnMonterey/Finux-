@@ -428,14 +428,29 @@ What it does
 
 When execve is handed a file that begins with ``MZ`` and whose PE header
 describes a 64-bit AMD64 executable, ``binfmt_pe`` maps it the way the
-Windows loader would: the headers read-only at the image's preferred base,
-then each section at its virtual address with the protection the section
-asks for - ``.text`` executable, ``.data`` writable - with the
-uninitialised tail (``.bss`` and the zero-fill past a section's file data)
-provided as anonymous zero pages.  It records the image layout for
-``/proc`` and core dumps, puts the thread on a valid aligned stack, and
-transfers control to the entry point.  That is enough to run a freestanding
-native PE: one that makes its own system calls and imports nothing.
+Windows loader would: the headers read-only, then each section at its
+virtual address with the protection the section asks for - ``.text``
+executable, ``.data`` writable - with the uninitialised tail (``.bss`` and
+the zero-fill past a section's file data) provided as anonymous zero pages.
+It records the image layout for ``/proc`` and core dumps, puts the thread
+on a valid aligned stack, and transfers control to the entry point.  That
+is enough to run a freestanding native PE: one that makes its own system
+calls and imports nothing.
+
+A section whose file data begins on a page boundary is mapped straight from
+the file, copy-on-write, like an ELF segment.  One whose file data does not
+- an image built with the old 512-byte file alignment - is backed by
+anonymous memory and copied in, so both alignments load.  The copy uses the
+same ``FOLL_FORCE`` write that ptrace uses to poke read-only text, which is
+what lets the loader fill an execute-only section without ever leaving it
+writable.
+
+Placement follows the same rule as a PIE ELF.  An image that carries base
+relocations can run anywhere, so under address-space randomisation it is
+loaded at a kernel-chosen base and its ``.reloc`` fixups (the AMD64 DIR64
+kind) are applied; an image whose preferred base is simply free keeps it.
+A non-relocatable image that cannot get its preferred base is refused
+rather than loaded at the wrong address.
 
 The header validation is factored into a pure function,
 ``pe_parse_headers()``, so that every "we only support ..." rule is in one
@@ -457,12 +472,6 @@ Not yet done                     Consequence
 Import resolution                a PE that calls into ``ntdll``/``kernel32``
                                  has nothing to call; only self-contained
                                  images run
-Base relocations                 an image that cannot get its preferred
-                                 address is refused, not relocated
-Sub-page file alignment          images built with the old 512-byte file
-                                 alignment are refused; the copy-in path is
-                                 future work (page alignment is mapped
-                                 directly from the file)
 PEB/TEB and process parameters   no process environment block, so the CRT
                                  startup of a normal EXE has nowhere to read
                                  its command line
