@@ -51,9 +51,16 @@ class Canvas {
 
   void fillRoundedRect(Rect r, double radius, Color c);
 
-  // Two-stop linear gradient. The shell proper uses flat fills; this exists
-  // for the desktop backdrop, where a single colour reads as obviously fake.
+  // Two-stop gradients. The shell proper uses flat fills; these exist for the
+  // desktop backdrop, where a single colour reads as obviously fake.
   void fillLinearGradient(Rect r, Point from, Point to, Color a, Color b);
+  void fillRadialGradient(Rect r, Point center, int radius, Color inner,
+                          Color outer);
+
+  // Arbitrary polygon, for backdrop geometry that is not axis-aligned.
+  void fillPolygon(const std::vector<Point>& points, Color c);
+  void fillPolygonGradient(const std::vector<Point>& points, Point from,
+                           Point to, Color a, Color b);
 
   // Glyph primitives.
   //
@@ -72,6 +79,9 @@ class Canvas {
 
   void blit(Point at, const Image& src);
   void blit(Point at, const Image& src, Rect srcRect);
+  // Scales `src` to fill `dest`. Used for wallpaper, which almost never
+  // matches the screen resolution exactly.
+  void blitScaled(Rect dest, const Image& src);
 
   // Clipping is a stack so widgets can nest without knowing their parents.
   void pushClip(Rect r);

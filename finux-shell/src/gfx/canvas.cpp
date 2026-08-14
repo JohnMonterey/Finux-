@@ -82,6 +82,50 @@ void Canvas::fillLinearGradient(Rect r, Point from, Point to, Color a,
   ctx_.fill_rect(toBl(clipped));
 }
 
+void Canvas::fillRadialGradient(Rect r, Point center, int radius, Color inner,
+                                Color outer) {
+  ensureContext();
+  const Rect clipped = r.intersected(clip_);
+  if (clipped.empty() || radius <= 0) return;
+  BLGradient gradient(BLRadialGradientValues(center.x, center.y, center.x,
+                                             center.y, radius));
+  gradient.add_stop(0.0, toBl(inner));
+  gradient.add_stop(1.0, toBl(outer));
+  ctx_.set_fill_style(gradient);
+  ctx_.fill_rect(toBl(clipped));
+}
+
+namespace {
+BLPath toPath(const std::vector<Point>& points) {
+  BLPath path;
+  if (points.empty()) return path;
+  path.move_to(points[0].x, points[0].y);
+  for (size_t i = 1; i < points.size(); ++i) {
+    path.line_to(points[i].x, points[i].y);
+  }
+  path.close();
+  return path;
+}
+}  // namespace
+
+void Canvas::fillPolygon(const std::vector<Point>& points, Color c) {
+  ensureContext();
+  if (points.size() < 3 || c.transparent()) return;
+  ctx_.set_fill_style(toBl(c));
+  ctx_.fill_path(toPath(points));
+}
+
+void Canvas::fillPolygonGradient(const std::vector<Point>& points, Point from,
+                                 Point to, Color a, Color b) {
+  ensureContext();
+  if (points.size() < 3) return;
+  BLGradient gradient(BLLinearGradientValues(from.x, from.y, to.x, to.y));
+  gradient.add_stop(0.0, toBl(a));
+  gradient.add_stop(1.0, toBl(b));
+  ctx_.set_fill_style(gradient);
+  ctx_.fill_path(toPath(points));
+}
+
 void Canvas::fillCircle(Point center, int radius, Color c) {
   ensureContext();
   if (radius <= 0 || c.transparent()) return;
@@ -138,6 +182,18 @@ void Canvas::blit(Point at, const Image& src, Rect srcRect) {
   ensureContext();
   if (!src.valid() || srcRect.empty()) return;
   ctx_.blit_image(BLPointI(at.x, at.y), src.bl(), toBl(srcRect));
+}
+
+void Canvas::blitScaled(Rect dest, const Image& src) {
+  ensureContext();
+  if (!src.valid() || dest.empty()) return;
+  ctx_.save();
+  // Bilinear rather than nearest: a wallpaper upscaled with nearest neighbour
+  // shows blocky stair-stepping that the acrylic blur then smears into visible
+  // banding.
+  ctx_.set_pattern_quality(BL_PATTERN_QUALITY_BILINEAR);
+  ctx_.blit_image(toBl(dest), src.bl());
+  ctx_.restore();
 }
 
 void Canvas::pushClip(Rect r) {

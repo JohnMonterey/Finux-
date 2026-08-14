@@ -15,10 +15,16 @@ Not yet built: context menus, the Start menu flyout wiring (it renders, but
 clicking Start does not open it yet), real application icons, live window
 thumbnails, and the Explorer window.
 
-    ./build/tools/finux-render-desktop desktop.png 1800 900 light
+The taskbar and Start menu are **acrylic**: their backdrop is blurred, then
+tinted, the way Windows composes them — not simply drawn at reduced alpha.
+
+    ./build/tools/finux-render-desktop desktop.png 1800 900 light [wallpaper]
+    ./build/src/finux-shell [wallpaper]
 
 renders the whole shell to a PNG, offscreen and deterministically — the
-artefact to hold next to a Windows 10 screenshot.
+artefact to hold next to a Windows 10 screenshot. Both take an optional
+wallpaper path (PNG/JPEG/BMP); with none supplied they draw an original
+procedural backdrop.
 
 ## Why not just theme GTK or Qt
 
@@ -71,6 +77,7 @@ cd build && ctest --output-on-failure
 | --- | --- |
 | `test_geometry` | Rect/colour algebra, DPI scaling at 100/125/150/175% |
 | `test_pixdiff` | The fidelity comparator itself |
+| `test_effects` | Acrylic: blur conservation, bounds, tint, determinism |
 | `test_canvas_interleave` | Drawing interleaved with direct pixel access |
 | `test_text` | Shaping, rasterisation, clipping, UTF-8-safe ellipsis |
 | `test_taskbar_render` | Offscreen taskbar layout and structure |
@@ -109,7 +116,9 @@ Two things this project legally cannot bundle:
   metric-compatible substitute, or supply Segoe UI from a machine you have
   licensed. The shell warns and keeps running on any other font, but metrics
   will not match and pixdiff tests will fail — correctly.
-- **Icons** from `shell32.dll` / `imageres.dll` are copyrighted.
+- **Icons** from `shell32.dll` / `imageres.dll` are copyrighted, as is the
+  shipped **wallpaper**. Point the shell at your own image; the procedural
+  backdrop it falls back to is original work.
 
 Reimplementing the look and behaviour is fine; redistributing Microsoft's
 binary assets is not. See `docs/ASSETS.md`.
@@ -119,10 +128,11 @@ binary assets is not. See `docs/ASSETS.md`.
 1. ✅ X11 backend, strut-reserving bar, Blend2D surface
 2. ✅ Widget/layout core, Windows-tuned text stack, pixel-diff harness
 3. ✅ Light theme, full taskbar chrome, notification area, Start menu layout
-4. ⬜ Start flyout wiring, context menus, real icons, hover thumbnails
-5. ⬜ `finux-explorer`: nav pane, breadcrumb address bar, Details/Icons views
-6. ⬜ File operations, ribbon, Trash, thumbnails
-7. ⬜ Wayland backend (wlr-layer-shell + foreign-toplevel + screencopy)
+4. ✅ Acrylic (blur + tint + noise), wallpaper loading, procedural backdrop
+5. ⬜ Start flyout wiring, context menus, real icons, hover thumbnails
+6. ⬜ `finux-explorer`: nav pane, breadcrumb address bar, Details/Icons views
+7. ⬜ File operations, ribbon, Trash, thumbnails
+8. ⬜ Wayland backend (wlr-layer-shell + foreign-toplevel + screencopy)
 
 **Wayland caveat:** the shell protocols exist only on wlroots compositors
 (Sway, Hyprland, labwc, river) and KWin. GNOME/Mutter implements none of

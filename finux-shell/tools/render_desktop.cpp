@@ -7,7 +7,12 @@
 // Rendering the composite directly sidesteps all of that, and because the
 // clock is injected rather than read, two runs produce identical bytes.
 //
-//   finux-render-desktop [output.png] [width] [height] [light|dark]
+//   finux-render-desktop [output.png] [width] [height] [light|dark] [wallpaper]
+//
+// The wallpaper argument is optional. Windows' own is Microsoft artwork and is
+// not redistributable, so with none supplied an original procedural backdrop
+// is drawn instead -- which also keeps the acrylic honest, since a blur over a
+// flat colour would show nothing at all.
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +23,7 @@
 #include "gfx/canvas.hpp"
 #include "gfx/image.hpp"
 #include "shell/startmenu.hpp"
+#include "shell/wallpaper.hpp"
 #include "shell/taskbar.hpp"
 #include "text/font.hpp"
 #include "text/text_renderer.hpp"
@@ -26,19 +32,6 @@
 using namespace finux;
 
 namespace {
-
-// A blue gradient standing in for the Windows 10 desktop background. The
-// shipped wallpaper is Microsoft artwork and is not redistributable; this is
-// only here so the shell's translucent edges have something to sit against.
-void paintBackdrop(gfx::Canvas& canvas, Rect screen) {
-  canvas.fillLinearGradient(screen, {screen.x, screen.y},
-                            {screen.right(), screen.bottom()},
-                            Color::rgb(0x0A63B0), Color::rgb(0x1E8FE0));
-  canvas.fillLinearGradient(
-      {screen.x, screen.y, screen.w, screen.h / 2}, {screen.x, screen.y},
-      {screen.x, screen.y + screen.h / 2}, Color::rgba(0x000000, 0x2A),
-      Color::rgba(0x000000, 0x00));
-}
 
 std::vector<platform::Toplevel> sampleWindows() {
   return {
@@ -54,6 +47,7 @@ int main(int argc, char** argv) {
   const int width = argc > 2 ? std::atoi(argv[2]) : 1800;
   const int height = argc > 3 ? std::atoi(argv[3]) : 900;
   const std::string mode = argc > 4 ? argv[4] : "light";
+  const std::string wallpaper = argc > 5 ? argv[5] : "";
 
   if (width <= 0 || height <= 0) {
     std::fprintf(stderr, "render-desktop: bad dimensions\n");
@@ -66,8 +60,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const ui::Theme theme =
+  ui::Theme theme =
       (mode == "dark") ? ui::Theme::win10Dark() : ui::Theme::win10Light();
+  theme.transparencyEffects = true;
 
   std::shared_ptr<text::Font> uiFont = fonts.open(
       text::FontLibrary::uiFontChain(),
@@ -109,7 +104,7 @@ int main(int argc, char** argv) {
 
   {
     gfx::Canvas canvas(surface);
-    paintBackdrop(canvas, screen);
+    shell::paintDesktop(canvas, screen, wallpaper, shell::Fit::Cover);
 
     ui::PaintContext ctx{canvas, renderer, theme, *uiFont, Point{0, 0}};
     startMenu.paintTree(ctx);
@@ -121,7 +116,9 @@ int main(int argc, char** argv) {
                  output.c_str());
     return 1;
   }
-  std::printf("wrote %s (%dx%d, %s theme, font '%s')\n", output.c_str(), width,
-              height, mode.c_str(), uiFont->family().c_str());
+  std::printf("wrote %s (%dx%d, %s theme, %s backdrop, font '%s')\n",
+              output.c_str(), width, height, mode.c_str(),
+              wallpaper.empty() ? "procedural" : wallpaper.c_str(),
+              uiFont->family().c_str());
   return 0;
 }

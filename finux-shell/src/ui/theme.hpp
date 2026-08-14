@@ -139,11 +139,32 @@ struct Palette {
   Color menuTextDisabled = Color::rgb(0x6D6D6D);
   Color menuHighlight = Color::rgba(0xFFFFFF, 0x1A);
   Color menuSeparator = Color::rgb(0x454545);
+
+  // --- Acrylic -------------------------------------------------------------
+  //
+  // Tints laid over a *blurred* copy of what is behind the surface, not over
+  // the raw backdrop. The alpha is how much of the tint covers that blur;
+  // Windows sits around 85%, high enough that text stays readable over any
+  // wallpaper while the backdrop still shows through as colour and movement.
+  Color taskbarAcrylic = Color::rgba(0x1F1F1F, 0xD9);
+  Color startMenuAcrylic = Color::rgba(0x1F1F1F, 0xD9);
+  Color startMenuTilePanelAcrylic = Color::rgba(0x272727, 0xD9);
+  Color startMenuRailAcrylic = Color::rgba(0x1B1B1B, 0xE0);
 };
 
 struct Theme {
   Metrics metrics;
   Palette palette;
+
+  // Windows' "Transparency effects" setting. When off, the shell paints its
+  // opaque palette colours and skips the blur entirely -- which is also what
+  // tests want, since a blurred backdrop makes exact colour assertions
+  // meaningless.
+  bool transparencyEffects = true;
+
+  // Blur radius for acrylic surfaces.
+  int acrylicBlurRadius = 30;
+  int acrylicNoise = 4;
 
   // Scale factor in percent (100, 125, 150, 175, 200), matching the values
   // Windows exposes. Kept as an integer because fractional DPI in a shell is
@@ -191,6 +212,11 @@ struct Theme {
     p.menuTextDisabled = Color::rgb(0x9A9A9A);
     p.menuHighlight = Color::rgba(0x000000, 0x0F);
     p.menuSeparator = Color::rgb(0xD6D6D6);
+
+    p.taskbarAcrylic = Color::rgba(0xF3F3F3, 0xD4);
+    p.startMenuAcrylic = Color::rgba(0xF2F2F2, 0xD9);
+    p.startMenuTilePanelAcrylic = Color::rgba(0xEAEDF0, 0xD9);
+    p.startMenuRailAcrylic = Color::rgba(0xEBEBEB, 0xE0);
     return theme;
   }
 
@@ -198,6 +224,14 @@ struct Theme {
   static Theme win10() { return win10Light(); }
 
   int scaled(int value) const { return (value * scalePercent + 50) / 100; }
+
+  // The colour a shell surface fills with: the acrylic tint when transparency
+  // is on (the caller having already blurred the backdrop), the flat colour
+  // when it is off. Routing both through one accessor keeps every widget from
+  // having to branch.
+  Color surface(Color opaque, Color acrylicTint) const {
+    return transparencyEffects ? acrylicTint : opaque;
+  }
 
   int taskbarHeight(bool smallButtons = false) const {
     return scaled(smallButtons ? metrics.taskbarHeightSmall

@@ -9,6 +9,7 @@
 #include "gfx/image.hpp"
 #include "platform/platform.hpp"
 #include "shell/taskbar.hpp"
+#include "shell/wallpaper.hpp"
 #include "text/font.hpp"
 #include "text/text_renderer.hpp"
 #include "ui/theme.hpp"
@@ -30,20 +31,29 @@ ClockText currentClock() {
   std::tm local{};
   localtime_r(&now, &local);
 
+  // Built by hand rather than with strftime: the formats Windows uses need
+  // unpadded hours and months (%l, %-m), which are GNU extensions rather than
+  // standard C, so a portable build warns on them and a non-glibc one would
+  // emit them literally.
+  const int hour24 = local.tm_hour;
+  const int hour12 = (hour24 % 12 == 0) ? 12 : hour24 % 12;
+
   char time[32] = {};
   char date[32] = {};
-  std::strftime(time, sizeof(time), "%l:%M %p", &local);
-  std::strftime(date, sizeof(date), "%-m/%-d/%Y", &local);
-
-  // %l pads to two characters with a leading space.
-  const char* trimmed = time;
-  while (*trimmed == ' ') ++trimmed;
-  return {trimmed, date};
+  std::snprintf(time, sizeof(time), "%d:%02d %s", hour12, local.tm_min,
+                hour24 < 12 ? "AM" : "PM");
+  std::snprintf(date, sizeof(date), "%d/%d/%d", local.tm_mon + 1,
+                local.tm_mday, local.tm_year + 1900);
+  return {time, date};
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // Optional wallpaper path. Windows' own is Microsoft artwork and cannot be
+  // shipped, so an original procedural backdrop stands in when none is given.
+  const std::string wallpaperPath = argc > 1 ? argv[1] : "";
+
   std::unique_ptr<platform::Platform> plat = platform::Platform::createX11();
   if (!plat) {
     std::fprintf(stderr,
@@ -109,7 +119,23 @@ int main() {
 
   const auto repaint = [&] {
     gfx::Canvas canvas(surface);
-    canvas.clear(theme.palette.taskbarBackground);
+
+    // Acrylic blurs whatever is behind the surface, so the wallpaper has to be
+    // in the surface before the bar paints. The desktop is drawn in screen
+    // coordinates shifted so the strip under the bar lands at the origin.
+    //
+    // This is pseudo-transparency: it reflects the wallpaper, not windows that
+    // happen to be behind the bar. Real see-through requires XComposite to
+    // sample the screen, which is a later stage; for a static wallpaper the
+    // result is identical.
+    if (theme.transparencyEffects) {
+      shell::paintDesktop(canvas,
+                          {-barGeometry.x, -barGeometry.y, monitor.w, monitor.h},
+                          wallpaperPath, shell::Fit::Cover);
+    } else {
+      canvas.clear(theme.palette.taskbarBackground);
+    }
+
     ui::PaintContext ctx{canvas,  textRenderer, theme,
                          *uiFont, Point{0, 0}};
     taskbar.paintTree(ctx);

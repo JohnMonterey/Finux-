@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "ui/acrylic.hpp"
 #include "ui/glyphs.hpp"
 
 namespace finux::shell {
@@ -458,7 +459,12 @@ void Taskbar::onPaint(PaintContext& ctx) {
   // Layout runs here because it needs measured text, and text measurement
   // needs the font that only the paint context carries.
   layoutIfNeeded(ctx);
-  ctx.fill(localBounds(), theme_.palette.taskbarBackground);
+
+  // Acrylic: blur what the surface already holds behind the bar, then lay the
+  // tint over it. With transparency off this is one opaque fill.
+  ui::blurBehind(ctx, localBounds());
+  ctx.fill(localBounds(), theme_.surface(theme_.palette.taskbarBackground,
+                                         theme_.palette.taskbarAcrylic));
 
   // Action Center lives at the right edge, drawn by the bar rather than as a
   // child because it has no hover state of its own yet.

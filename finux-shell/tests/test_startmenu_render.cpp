@@ -47,7 +47,11 @@ int main() {
     return finux::check::skip("startmenu_render", "FreeType failed to init");
   }
 
-  const ui::Theme theme = ui::Theme::win10();
+  ui::Theme theme = ui::Theme::win10();  // light, as Windows ships
+  // Transparency off: acrylic blurs whatever is behind the surface, which
+  // makes exact colour assertions meaningless. The acrylic path has its own
+  // coverage in test_effects and in the translucency check below.
+  theme.transparencyEffects = false;
   const ui::Metrics& m = theme.metrics;
 
   text::FontOptions options;

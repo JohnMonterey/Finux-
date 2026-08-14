@@ -43,7 +43,10 @@ class Image {
   void fill(Color c);
 
   bool savePng(const std::string& path) const;
+  // Decodes whatever Blend2D's built-in codecs handle -- PNG, JPEG, BMP --
+  // despite the name, which reflects the only format the shell writes.
   static Image loadPng(const std::string& path);
+  static Image load(const std::string& path) { return loadPng(path); }
 
  private:
   BLImage impl_;

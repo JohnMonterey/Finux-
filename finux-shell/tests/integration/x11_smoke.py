@@ -27,9 +27,14 @@ BAR_HEIGHT = 40
 START_BUTTON_WIDTH = 48
 SCREEN_W, SCREEN_H = 1280, 800
 
-# The shell defaults to the light theme, as Windows 10 ships.
-TASKBAR_BG = (243, 243, 243)
+# The shell defaults to the light theme, as Windows 10 ships. The bar is not
+# this exact colour on screen: acrylic tints it over a blurred backdrop, so it
+# lands darker. TASKBAR_TINT is the flat colour transparency-off would give.
+TASKBAR_TINT = (243, 243, 243)
 ACCENT = (0, 120, 215)
+# A stretch of bar with no buttons or tray icons in it, used as the reference
+# for "what does the bar surface look like here".
+EMPTY_BAR = (900, 1000)
 
 
 def skip(reason):
@@ -73,6 +78,25 @@ class Xwd:
             for y in range(y0, y1)
             for x in range(x0, x1)
             if self.pixel(x, y) != color
+        )
+
+    def mean_luma(self, x0, x1, y0, y1):
+        total = n = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                r, g, b = self.pixel(x, y)
+                total += 0.2126 * r + 0.7152 * g + 0.0722 * b
+                n += 1
+        return total / max(1, n)
+
+    def count_differing(self, reference, x0, x1, y0, y1, threshold=30):
+        """Pixels differing from `reference` in any channel by > threshold."""
+        return sum(
+            1
+            for y in range(y0, y1)
+            for x in range(x0, x1)
+            if max(abs(a - b) for a, b in zip(self.pixel(x, y), reference))
+            > threshold
         )
 
 
@@ -222,10 +246,22 @@ def main():
             image = Xwd(capture)
             top = image.height - BAR_HEIGHT
 
-            check(image.pixel(900, top + 4) == TASKBAR_BG,
-                  "taskbar background reached the screen")
+            # Acrylic: the bar must be light (light theme) but NOT the flat
+            # tint colour, because it is composited over a blurred backdrop.
+            # Asserting the flat colour would pass only if acrylic were broken.
+            bar_luma = image.mean_luma(EMPTY_BAR[0], EMPTY_BAR[1], top + 2,
+                                       image.height - 2)
+            tint_luma = (0.2126 * TASKBAR_TINT[0] + 0.7152 * TASKBAR_TINT[1] +
+                         0.0722 * TASKBAR_TINT[2])
+            check(bar_luma > 120,
+                  f"taskbar surface is not light ({bar_luma:.0f})")
+            check(bar_luma < tint_luma - 5,
+                  f"taskbar is the flat tint ({bar_luma:.0f} vs "
+                  f"{tint_luma:.0f}) -- acrylic did not sample the backdrop")
 
-            start_ink = image.count_not(TASKBAR_BG, 0, 48, top, image.height)
+            surface = image.pixel(EMPTY_BAR[0] + 20, top + 6)
+            start_ink = image.count_differing(surface, 0, 48, top,
+                                              image.height)
             check(start_ink > 0, f"start button drew ({start_ink} px)")
 
             # One accent run per running window. Buttons are icon-only by
@@ -241,8 +277,8 @@ def main():
                   f"one running indicator per client window (got {len(runs)}, "
                   f"want 2)")
             for index, (x0, x1) in enumerate(runs):
-                icon_ink = image.count_not(TASKBAR_BG, x0, x1 + 1, top + 8,
-                                           top + 32)
+                icon_ink = image.count_differing(surface, x0, x1 + 1, top + 8,
+                                                 top + 32)
                 check(icon_ink > 0,
                       f"task button {index} drew no icon above its indicator")
 
@@ -254,8 +290,8 @@ def main():
             check(start_accent > 200,
                   f"start button is not accent-filled ({start_accent} px)")
 
-            clock_ink = image.count_not(TASKBAR_BG, 1195, image.width - 8, top,
-                                        image.height)
+            clock_ink = image.count_differing(surface, 1195, image.width - 8,
+                                              top, image.height)
             check(clock_ink > 0, f"clock drew ({clock_ink} px)")
 
             # The bar must not list itself, so the count above already proves

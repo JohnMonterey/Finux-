@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "ui/acrylic.hpp"
 #include "ui/glyphs.hpp"
 
 namespace finux::shell {
@@ -198,7 +199,11 @@ void StartMenu::onPaint(PaintContext& ctx) {
   const int railWidth = ctx.theme.scaled(m.startMenuRailWidth);
   const int listWidth = ctx.theme.scaled(m.startMenuAppListWidth);
 
-  ctx.fill(box, ctx.theme.palette.startMenuBackground);
+  // One blur for the whole flyout, then three tints over it. Blurring each
+  // column separately would show a seam at their boundaries.
+  ui::blurBehind(ctx, box);
+  ctx.fill(box, ctx.theme.surface(ctx.theme.palette.startMenuBackground,
+                                  ctx.theme.palette.startMenuAcrylic));
 
   paintRail(ctx, {box.x, box.y, railWidth, box.h});
   paintAppList(ctx, {box.x + railWidth, box.y, listWidth, box.h});
@@ -213,7 +218,8 @@ void StartMenu::onPaint(PaintContext& ctx) {
 
 void StartMenu::paintRail(PaintContext& ctx, Rect box) const {
   const ui::Metrics& m = ctx.theme.metrics;
-  ctx.fill(box, ctx.theme.palette.startMenuRail);
+  ctx.fill(box, ctx.theme.surface(ctx.theme.palette.startMenuRail,
+                                  ctx.theme.palette.startMenuRailAcrylic));
 
   const int icon = ctx.theme.scaled(m.startRailIconSize);
   const int slot = ctx.theme.scaled(44);
@@ -281,7 +287,8 @@ void StartMenu::paintTilePanel(PaintContext& ctx, Rect box) const {
   const ui::Metrics& m = ctx.theme.metrics;
   const ui::Palette& palette = ctx.theme.palette;
 
-  ctx.fill(box, palette.startMenuTilePanel);
+  ctx.fill(box, ctx.theme.surface(palette.startMenuTilePanel,
+                                  palette.startMenuTilePanelAcrylic));
 
   const int padding = ctx.theme.scaled(m.startMenuTilePadding);
   const int cell = ctx.theme.scaled(m.tileCell);
