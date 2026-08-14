@@ -37,6 +37,7 @@ struct fs_struct;
 struct inode;
 struct seq_file;
 struct super_block;
+struct nt_share;
 
 /* Longest "\Device\HarddiskVolume4294967295" style name we generate. */
 #define NT_VOL_DEVNAME_MAX	48
@@ -446,37 +447,69 @@ void nt_ci_cache_stats(struct seq_file *m);
 /**
  * struct nt_create_req - what a caller is asking nt_create() to do
  * @disposition:  one of NT_DISPOSITION_*; decides create vs open vs truncate
+ * @access:       NT_ACCESS_* the handle wants; the share check turns on the
+ *                read/write/delete distinction within it
+ * @share:        NT_SHARE_* this open grants other openers; 0 is exclusive
  * @options:      NT_CREATE_* flags
  * @attributes:   NT_FILE_ATTRIBUTE_* to stamp on a file this call creates.
  *                Ignored when an existing file is opened, exactly as
  *                CreateFile ignores dwFlagsAndAttributes on an open.
  * @resolve_flags: NT_RESOLVE_* passed through to path resolution; the
  *                case-sensitivity of the lookup is a caller decision.
- *
- * Deliberately does not carry a desired-access or share-access field yet:
- * nothing in this stage enforces them, and a request field that is
- * recorded but not honoured is a promise with a caller attached.  They
- * arrive with the stage that enforces them.
  */
 struct nt_create_req {
 	u32	disposition;
+	u32	access;
+	u32	share;
 	u32	options;
 	u32	attributes;
 	u32	resolve_flags;
 };
 
 /**
+ * struct nt_open - one open instance: the file object a create/open returns
+ * @path:    the object; holds references to mount and dentry
+ * @volume:  volume the path was resolved through; holds a reference
+ * @share:   per-inode share-control block this open is registered in
+ * @node:    link in nt_share::opens
+ * @access:  NT_ACCESS_* granted to this handle
+ * @share_mode: NT_SHARE_* this handle grants others
+ * @delete_on_close: unlink the file when the last handle closes
+ *
+ * This is the NT file object.  It is created by nt_create() and released
+ * by nt_close(); a caller must call nt_close() exactly once, never
+ * nt_path_put() on the embedded path.
+ */
+struct nt_open {
+	struct path		path;
+	struct nt_volume	*volume;
+	struct nt_share		*share;
+	struct list_head	node;
+	u32			access;
+	u32			share_mode;
+	bool			delete_on_close;
+};
+
+/**
  * struct nt_open_result - what nt_create() did
- * @path:   the resolved or newly created object; release with nt_path_put()
+ * @handle: the open file object; release with nt_close()
  * @result: one of NT_RESULT_*, the IoStatusBlock.Information equivalent
  */
 struct nt_open_result {
-	struct nt_path	path;
+	struct nt_open	*handle;
 	u32		result;
 };
 
 int nt_create(struct nt_task_ctx *ctx, const char *name,
 	      const struct nt_create_req *req, struct nt_open_result *out);
+void nt_close(struct nt_open *handle);
+
+/* --- share / delete semantics (fs/ntpers/share.c) -------------------- */
+
+int nt_share_open(struct nt_open *open);
+bool nt_share_close(struct nt_open *open);
+int nt_share_subsystem_init(void);
+void nt_share_subsystem_exit(void);
 
 /* --- file metadata (fs/ntpers/meta.c) -------------------------------- */
 

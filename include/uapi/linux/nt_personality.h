@@ -241,6 +241,43 @@ enum nt_path_type {
 #define NT_CREATE_DIRECTORY		(1U << 0)
 /* Open a reparse point itself rather than following it (FILE_OPEN_REPARSE_POINT). */
 #define NT_CREATE_OPEN_REPARSE		(1U << 1)
+/* Delete the file when the last handle to it closes (FILE_DELETE_ON_CLOSE). */
+#define NT_CREATE_DELETE_ON_CLOSE	(1U << 2)
+
+/*
+ * Access rights, at their Win32 numbering.  A handle records the access
+ * it was granted; the sharing rules below are enforced against it.  Only
+ * the rights that bear on sharing and on the operations this layer
+ * performs are called out - the read/write/delete distinction is what the
+ * share check turns on.  GENERIC_* are the caller-facing masks that map
+ * onto the specific rights.
+ */
+#define NT_ACCESS_FILE_READ_DATA	0x00000001
+#define NT_ACCESS_FILE_WRITE_DATA	0x00000002
+#define NT_ACCESS_FILE_APPEND_DATA	0x00000004
+#define NT_ACCESS_FILE_READ_EA		0x00000008
+#define NT_ACCESS_FILE_WRITE_EA		0x00000010
+#define NT_ACCESS_FILE_EXECUTE		0x00000020
+#define NT_ACCESS_FILE_READ_ATTRIBUTES	0x00000080
+#define NT_ACCESS_FILE_WRITE_ATTRIBUTES	0x00000100
+#define NT_ACCESS_DELETE		0x00010000
+#define NT_ACCESS_READ_CONTROL		0x00020000
+#define NT_ACCESS_WRITE_DAC		0x00040000
+#define NT_ACCESS_WRITE_OWNER		0x00080000
+#define NT_ACCESS_SYNCHRONIZE		0x00100000
+#define NT_ACCESS_GENERIC_ALL		0x10000000
+#define NT_ACCESS_GENERIC_EXECUTE	0x20000000
+#define NT_ACCESS_GENERIC_WRITE		0x40000000
+#define NT_ACCESS_GENERIC_READ		0x80000000
+
+/*
+ * Share modes (CreateFile dwShareMode).  A handle grants these to other
+ * openers: FILE_SHARE_READ says "others may open me for reading too".  A
+ * share mode of 0 is exclusive access, the CreateFile default.
+ */
+#define NT_SHARE_READ			0x00000001
+#define NT_SHARE_WRITE			0x00000002
+#define NT_SHARE_DELETE			0x00000004
 
 /*
  * ---------------------------------------------------------------------

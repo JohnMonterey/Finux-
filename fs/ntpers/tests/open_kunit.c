@@ -67,12 +67,36 @@ static void nt_open_test_exit(struct kunit *test)
 
 #define CTX(test) ((struct nt_open_ctx *)(test)->priv)
 
-/* Issue one create/open.  On success the caller must nt_path_put(&out->path). */
+/* Full access, full sharing: the disposition tests below turn on neither. */
+#define NT_OP_ALL_ACCESS	(NT_ACCESS_GENERIC_READ | NT_ACCESS_GENERIC_WRITE | \
+				 NT_ACCESS_DELETE)
+#define NT_OP_ALL_SHARE		(NT_SHARE_READ | NT_SHARE_WRITE | NT_SHARE_DELETE)
+
+/* Issue one create/open.  On success the caller must nt_close(out->handle). */
 static int nt_op(struct kunit *test, const char *path, u32 disposition,
 		 u32 options, struct nt_open_result *out)
 {
 	struct nt_create_req req = {
 		.disposition	= disposition,
+		.access		= NT_OP_ALL_ACCESS,
+		.share		= NT_OP_ALL_SHARE,
+		.options	= options,
+		.attributes	= 0,
+		.resolve_flags	= NT_RESOLVE_CASE_INSENSITIVE,
+	};
+
+	return nt_create(CTX(test)->tc, path, &req, out);
+}
+
+/* As nt_op(), but with explicit access and share mode for the share tests. */
+static int nt_op_share(struct kunit *test, const char *path, u32 disposition,
+		       u32 access, u32 share, u32 options,
+		       struct nt_open_result *out)
+{
+	struct nt_create_req req = {
+		.disposition	= disposition,
+		.access		= access,
+		.share		= share,
 		.options	= options,
 		.attributes	= 0,
 		.resolve_flags	= NT_RESOLVE_CASE_INSENSITIVE,
@@ -91,9 +115,9 @@ static void nt_op_create_new_absent(struct kunit *test)
 			nt_op(test, "C:\\New.txt", NT_DISPOSITION_CREATE_NEW, 0,
 			      &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_CREATED);
-	KUNIT_EXPECT_TRUE(test, d_is_positive(out.path.path.dentry));
-	KUNIT_EXPECT_TRUE(test, S_ISREG(d_inode(out.path.path.dentry)->i_mode));
-	nt_path_put(&out.path);
+	KUNIT_EXPECT_TRUE(test, d_is_positive(out.handle->path.dentry));
+	KUNIT_EXPECT_TRUE(test, S_ISREG(d_inode(out.handle->path.dentry)->i_mode));
+	nt_close(out.handle);
 }
 
 static void nt_op_open_existing_absent(struct kunit *test)
@@ -124,7 +148,7 @@ static void nt_op_open_always_absent(struct kunit *test)
 			nt_op(test, "C:\\Made.txt",
 			      NT_DISPOSITION_OPEN_ALWAYS, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_CREATED);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 static void nt_op_create_always_absent(struct kunit *test)
@@ -135,7 +159,7 @@ static void nt_op_create_always_absent(struct kunit *test)
 			nt_op(test, "C:\\Fresh.txt",
 			      NT_DISPOSITION_CREATE_ALWAYS, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_CREATED);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 /* --------------------------------------------------------- exists side */
@@ -148,7 +172,7 @@ static void seed(struct kunit *test, const char *path)
 	KUNIT_ASSERT_EQ(test,
 			nt_op(test, path, NT_DISPOSITION_CREATE_NEW, 0, &out),
 			0);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 static void nt_op_create_new_exists(struct kunit *test)
@@ -171,7 +195,7 @@ static void nt_op_open_existing_exists(struct kunit *test)
 			nt_op(test, "C:\\Have.txt",
 			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_OPENED);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 static void nt_op_open_always_exists(struct kunit *test)
@@ -183,7 +207,7 @@ static void nt_op_open_always_exists(struct kunit *test)
 			nt_op(test, "C:\\Have.txt",
 			      NT_DISPOSITION_OPEN_ALWAYS, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_OPENED);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 /*
@@ -201,19 +225,19 @@ static void nt_op_create_always_exists_truncates(struct kunit *test)
 	KUNIT_ASSERT_EQ(test,
 			nt_op(test, "C:\\Big.txt",
 			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), 0);
-	seeded = dget(out.path.path.dentry);
-	KUNIT_ASSERT_EQ(test, vfs_truncate(&out.path.path, 4096), 0);
+	seeded = dget(out.handle->path.dentry);
+	KUNIT_ASSERT_EQ(test, vfs_truncate(&out.handle->path, 4096), 0);
 	KUNIT_ASSERT_EQ(test, i_size_read(d_inode(seeded)), 4096);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 
 	KUNIT_ASSERT_EQ(test,
 			nt_op(test, "C:\\Big.txt",
 			      NT_DISPOSITION_CREATE_ALWAYS, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_OVERWRITTEN);
 	/* Same object, now empty. */
-	KUNIT_EXPECT_PTR_EQ(test, out.path.path.dentry, seeded);
+	KUNIT_EXPECT_PTR_EQ(test, out.handle->path.dentry, seeded);
 	KUNIT_EXPECT_EQ(test, i_size_read(d_inode(seeded)), 0);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 	dput(seeded);
 }
 
@@ -233,8 +257,8 @@ static void nt_op_case_collision(struct kunit *test)
 	KUNIT_ASSERT_EQ(test,
 			nt_op(test, "C:\\Kernel32.dll",
 			      NT_DISPOSITION_CREATE_NEW, 0, &out), 0);
-	original = dget(out.path.path.dentry);
-	nt_path_put(&out.path);
+	original = dget(out.handle->path.dentry);
+	nt_close(out.handle);
 
 	/* CREATE_NEW of a different casing is a collision, not a new file. */
 	KUNIT_EXPECT_EQ_MSG(test,
@@ -248,17 +272,17 @@ static void nt_op_case_collision(struct kunit *test)
 			nt_op(test, "C:\\KERNEL32.DLL",
 			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_OPENED);
-	KUNIT_EXPECT_PTR_EQ_MSG(test, out.path.path.dentry, original,
+	KUNIT_EXPECT_PTR_EQ_MSG(test, out.handle->path.dentry, original,
 				"a case-variant open must find the original");
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 
 	/* OPEN_ALWAYS likewise opens rather than creating a duplicate. */
 	KUNIT_ASSERT_EQ(test,
 			nt_op(test, "C:\\kErNeL32.DlL",
 			      NT_DISPOSITION_OPEN_ALWAYS, 0, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_OPENED);
-	KUNIT_EXPECT_PTR_EQ(test, out.path.path.dentry, original);
-	nt_path_put(&out.path);
+	KUNIT_EXPECT_PTR_EQ(test, out.handle->path.dentry, original);
+	nt_close(out.handle);
 
 	dput(original);
 }
@@ -274,11 +298,11 @@ static void nt_op_created_file_has_archive(struct kunit *test)
 	KUNIT_ASSERT_EQ(test,
 			nt_op(test, "C:\\Doc.txt", NT_DISPOSITION_CREATE_NEW,
 			      0, &out), 0);
-	KUNIT_ASSERT_EQ(test, nt_get_file_attributes(&out.path.path, &attrs),
+	KUNIT_ASSERT_EQ(test, nt_get_file_attributes(&out.handle->path, &attrs),
 			0);
 	KUNIT_EXPECT_TRUE_MSG(test, attrs & NT_FILE_ATTRIBUTE_ARCHIVE,
 			      "a new file should have ARCHIVE set");
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 /* A new directory is a directory, and does not get ARCHIVE. */
@@ -291,12 +315,12 @@ static void nt_op_create_directory(struct kunit *test)
 			nt_op(test, "C:\\SubDir", NT_DISPOSITION_CREATE_NEW,
 			      NT_CREATE_DIRECTORY, &out), 0);
 	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_CREATED);
-	KUNIT_EXPECT_TRUE(test, S_ISDIR(d_inode(out.path.path.dentry)->i_mode));
-	KUNIT_ASSERT_EQ(test, nt_get_file_attributes(&out.path.path, &attrs),
+	KUNIT_EXPECT_TRUE(test, S_ISDIR(d_inode(out.handle->path.dentry)->i_mode));
+	KUNIT_ASSERT_EQ(test, nt_get_file_attributes(&out.handle->path, &attrs),
 			0);
 	KUNIT_EXPECT_TRUE(test, attrs & NT_FILE_ATTRIBUTE_DIRECTORY);
 	KUNIT_EXPECT_FALSE(test, attrs & NT_FILE_ATTRIBUTE_ARCHIVE);
-	nt_path_put(&out.path);
+	nt_close(out.handle);
 }
 
 /* ------------------------------------------------------------ refusals */
@@ -327,6 +351,185 @@ static void nt_op_stream_refused(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
+/* ---------------------------------------------------------- sharing */
+
+/*
+ * An exclusive open (share mode 0) blocks any second open, as Win32's
+ * default CreateFile share mode does.
+ */
+static void nt_op_exclusive_blocks_second(struct kunit *test)
+{
+	struct nt_open_result a, b;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Excl.dat",
+				    NT_DISPOSITION_CREATE_NEW,
+				    NT_ACCESS_GENERIC_READ, 0, 0, &a), 0);
+
+	KUNIT_EXPECT_EQ_MSG(test,
+			    nt_op_share(test, "C:\\Excl.dat",
+					NT_DISPOSITION_OPEN_EXISTING,
+					NT_ACCESS_GENERIC_READ, 0, 0, &b),
+			    -EBUSY, "a second open of an exclusive file must fail");
+
+	/* Once the first handle is closed the file opens again. */
+	nt_close(a.handle);
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Excl.dat",
+				    NT_DISPOSITION_OPEN_EXISTING,
+				    NT_ACCESS_GENERIC_READ, 0, 0, &b), 0);
+	nt_close(b.handle);
+}
+
+/* Two readers that both grant FILE_SHARE_READ coexist. */
+static void nt_op_two_shared_readers(struct kunit *test)
+{
+	struct nt_open_result a, b;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Doc.dat",
+				    NT_DISPOSITION_CREATE_NEW,
+				    NT_ACCESS_GENERIC_READ, NT_SHARE_READ, 0,
+				    &a), 0);
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Doc.dat",
+				    NT_DISPOSITION_OPEN_EXISTING,
+				    NT_ACCESS_GENERIC_READ, NT_SHARE_READ, 0,
+				    &b), 0);
+	nt_close(a.handle);
+	nt_close(b.handle);
+}
+
+/*
+ * A reader that does not grant FILE_SHARE_WRITE is refused while a writer
+ * is open, because the writer's access is not one it tolerates.
+ */
+static void nt_op_reader_conflicts_with_writer(struct kunit *test)
+{
+	struct nt_open_result a, b;
+
+	/* Writer, sharing read only. */
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Log.dat",
+				    NT_DISPOSITION_CREATE_NEW,
+				    NT_ACCESS_GENERIC_READ |
+				    NT_ACCESS_GENERIC_WRITE, NT_SHARE_READ, 0,
+				    &a), 0);
+
+	/* Reader that will not tolerate the existing writer. */
+	KUNIT_EXPECT_EQ(test,
+			nt_op_share(test, "C:\\Log.dat",
+				    NT_DISPOSITION_OPEN_EXISTING,
+				    NT_ACCESS_GENERIC_READ, NT_SHARE_READ, 0,
+				    &b), -EBUSY);
+
+	nt_close(a.handle);
+}
+
+/* Wanting DELETE while an existing open does not grant FILE_SHARE_DELETE. */
+static void nt_op_delete_needs_share_delete(struct kunit *test)
+{
+	struct nt_open_result a, b;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Keep.dat",
+				    NT_DISPOSITION_CREATE_NEW,
+				    NT_ACCESS_GENERIC_READ,
+				    NT_SHARE_READ | NT_SHARE_WRITE, 0, &a), 0);
+
+	KUNIT_EXPECT_EQ(test,
+			nt_op_share(test, "C:\\Keep.dat",
+				    NT_DISPOSITION_OPEN_EXISTING,
+				    NT_ACCESS_DELETE,
+				    NT_SHARE_READ | NT_SHARE_WRITE |
+				    NT_SHARE_DELETE, 0, &b), -EBUSY);
+
+	nt_close(a.handle);
+}
+
+/* ------------------------------------------------------ delete-on-close */
+
+/* A delete-on-close handle removes the file when it is closed. */
+static void nt_op_delete_on_close_removes_file(struct kunit *test)
+{
+	struct nt_open_result out;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Temp.dat",
+				    NT_DISPOSITION_CREATE_NEW, NT_OP_ALL_ACCESS,
+				    NT_OP_ALL_SHARE, NT_CREATE_DELETE_ON_CLOSE,
+				    &out), 0);
+	nt_close(out.handle);
+
+	KUNIT_EXPECT_EQ_MSG(test,
+			    nt_op(test, "C:\\Temp.dat",
+				  NT_DISPOSITION_OPEN_EXISTING, 0, &out),
+			    -ENOENT, "a delete-on-close file must be gone");
+}
+
+/*
+ * While a delete-on-close handle is open the delete is pending, and other
+ * opens are refused - the file is on its way out.  The delete happens when
+ * the marking handle closes.
+ */
+static void nt_op_delete_pending_blocks_open(struct kunit *test)
+{
+	struct nt_open_result a, b;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Going.dat",
+				    NT_DISPOSITION_CREATE_NEW, NT_OP_ALL_ACCESS,
+				    NT_OP_ALL_SHARE, NT_CREATE_DELETE_ON_CLOSE,
+				    &a), 0);
+
+	KUNIT_EXPECT_EQ_MSG(test,
+			    nt_op(test, "C:\\Going.dat",
+				  NT_DISPOSITION_OPEN_EXISTING, 0, &b),
+			    -ENOENT, "opens are refused while delete is pending");
+
+	nt_close(a.handle);
+
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Going.dat",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &b), -ENOENT);
+}
+
+/*
+ * Delete-on-close only fires on the *last* close: a second handle opened
+ * before the delete was marked keeps the file until it too closes.
+ */
+static void nt_op_delete_on_close_waits_for_last(struct kunit *test)
+{
+	struct nt_open_result keeper, deleter, check;
+
+	/* An ordinary handle, opened first. */
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Shared.dat",
+				    NT_DISPOSITION_CREATE_NEW, NT_OP_ALL_ACCESS,
+				    NT_OP_ALL_SHARE, 0, &keeper), 0);
+
+	/* A delete-on-close handle on the same file. */
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Shared.dat",
+				    NT_DISPOSITION_OPEN_EXISTING, NT_OP_ALL_ACCESS,
+				    NT_OP_ALL_SHARE, NT_CREATE_DELETE_ON_CLOSE,
+				    &deleter), 0);
+
+	/* Closing the delete-on-close handle does not remove it yet. */
+	nt_close(deleter.handle);
+
+	/* But the name is delete-pending, so it cannot be reopened. */
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Shared.dat",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &check), -ENOENT);
+
+	/* The last close removes it. */
+	nt_close(keeper.handle);
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Shared.dat",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &check), -ENOENT);
+}
+
 static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_create_new_absent),
 	KUNIT_CASE(nt_op_open_existing_absent),
@@ -342,6 +545,13 @@ static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_create_directory),
 	KUNIT_CASE(nt_op_reserved_name_refused),
 	KUNIT_CASE(nt_op_stream_refused),
+	KUNIT_CASE(nt_op_exclusive_blocks_second),
+	KUNIT_CASE(nt_op_two_shared_readers),
+	KUNIT_CASE(nt_op_reader_conflicts_with_writer),
+	KUNIT_CASE(nt_op_delete_needs_share_delete),
+	KUNIT_CASE(nt_op_delete_on_close_removes_file),
+	KUNIT_CASE(nt_op_delete_pending_blocks_open),
+	KUNIT_CASE(nt_op_delete_on_close_waits_for_last),
 	{}
 };
 

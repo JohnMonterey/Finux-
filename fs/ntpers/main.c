@@ -57,9 +57,13 @@ static int __init nt_personality_init(void)
 	if (err)
 		goto err_casefold;
 
-	err = nt_debugfs_init();
+	err = nt_share_subsystem_init();
 	if (err)
 		goto err_namespace;
+
+	err = nt_debugfs_init();
+	if (err)
+		goto err_share;
 
 	WRITE_ONCE(nt_ready, true);
 
@@ -67,6 +71,8 @@ static int __init nt_personality_init(void)
 		init_nt_ns.computer_name);
 	return 0;
 
+err_share:
+	nt_share_subsystem_exit();
 err_namespace:
 	nt_namespace_exit();
 err_casefold:
