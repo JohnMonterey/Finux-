@@ -342,17 +342,6 @@ static void nt_op_reserved_name_refused(struct kunit *test)
 			-EPERM);
 }
 
-/* A stream create is a separate feature and must say so, not half-do it. */
-static void nt_op_stream_refused(struct kunit *test)
-{
-	struct nt_open_result out;
-
-	KUNIT_EXPECT_EQ(test,
-			nt_op(test, "C:\\f.txt:stream",
-			      NT_DISPOSITION_CREATE_NEW, 0, &out),
-			-EOPNOTSUPP);
-}
-
 /* ---------------------------------------------------------- sharing */
 
 /*
@@ -599,6 +588,197 @@ static void nt_op_access_check_enforces_mode(struct kunit *test)
 	dput(file);
 }
 
+/* --------------------------------------------------- data streams */
+
+/*
+ * A named stream is created through nt_create(), written and read back,
+ * and the base file it hangs off exists as an ordinary file whose own
+ * contents were never touched.
+ */
+static void nt_op_stream_create_write_read(struct kunit *test)
+{
+	struct nt_open_result out;
+	char buf[16];
+	ssize_t n;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Notes.txt:tag",
+			      NT_DISPOSITION_CREATE_NEW, 0, &out), 0);
+	KUNIT_EXPECT_EQ(test, out.result, (u32)NT_RESULT_CREATED);
+	KUNIT_ASSERT_NOT_NULL(test, out.handle->stream);
+
+	KUNIT_EXPECT_EQ(test,
+			nt_stream_write(&out.handle->path, out.handle->stream,
+					out.handle->stream_len, 0, "hello", 5),
+			5);
+	n = nt_stream_read(&out.handle->path, out.handle->stream,
+			   out.handle->stream_len, 0, buf, sizeof(buf));
+	KUNIT_EXPECT_EQ(test, n, 5);
+	KUNIT_EXPECT_EQ(test, memcmp(buf, "hello", 5), 0);
+	nt_close(out.handle);
+
+	/* The base file exists and is an ordinary regular file. */
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Notes.txt",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), 0);
+	KUNIT_EXPECT_TRUE(test, S_ISREG(d_inode(out.handle->path.dentry)->i_mode));
+	nt_close(out.handle);
+}
+
+/* Dispositions apply to the stream, and require the base file to exist. */
+static void nt_op_stream_dispositions(struct kunit *test)
+{
+	struct nt_open_result out;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Doc.txt:s", NT_DISPOSITION_CREATE_NEW,
+			      0, &out), 0);
+	nt_close(out.handle);
+
+	/* CREATE_NEW of an existing stream collides. */
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Doc.txt:s", NT_DISPOSITION_CREATE_NEW,
+			      0, &out), -EEXIST);
+
+	/* A missing stream on an existing base is -ENOENT. */
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Doc.txt:other",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), -ENOENT);
+
+	/* A stream on a base that does not exist is -ENOENT. */
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Nope.txt:s",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), -ENOENT);
+}
+
+/* Delete-on-close of a stream removes the stream, not the base file. */
+static void nt_op_stream_delete_on_close(struct kunit *test)
+{
+	struct nt_open_result out;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Keep.txt:temp",
+			      NT_DISPOSITION_CREATE_NEW, 0, &out), 0);
+	nt_close(out.handle);
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op_share(test, "C:\\Keep.txt:temp",
+				    NT_DISPOSITION_OPEN_EXISTING, NT_OP_ALL_ACCESS,
+				    NT_OP_ALL_SHARE, NT_CREATE_DELETE_ON_CLOSE,
+				    &out), 0);
+	nt_close(out.handle);
+
+	/* The stream is gone... */
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\Keep.txt:temp",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), -ENOENT);
+	/* ...but the file is not. */
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Keep.txt",
+			      NT_DISPOSITION_OPEN_EXISTING, 0, &out), 0);
+	nt_close(out.handle);
+}
+
+struct nt_stream_tally {
+	int count;
+	loff_t last_size;
+};
+
+static int nt_stream_tally_cb(void *ctx, const char *name, size_t len,
+			      loff_t size)
+{
+	struct nt_stream_tally *t = ctx;
+
+	t->count++;
+	t->last_size = size;
+	return 0;
+}
+
+/* Enumeration reports each named stream and its size, not the base $DATA. */
+static void nt_op_stream_enumerate(struct kunit *test)
+{
+	struct nt_open_result out;
+	struct nt_stream_tally tally = { 0 };
+	struct path base;
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Multi.txt:alpha",
+			      NT_DISPOSITION_CREATE_NEW, 0, &out), 0);
+	base = out.handle->path;	/* borrowed while the handle is open */
+
+	KUNIT_ASSERT_EQ(test, nt_stream_set(&base, "beta", 4, "BB", 2), 0);
+
+	KUNIT_ASSERT_EQ(test,
+			nt_stream_list(&base, nt_stream_tally_cb, &tally), 0);
+	KUNIT_EXPECT_EQ_MSG(test, tally.count, 2,
+			    "two named streams should be enumerated");
+	nt_close(out.handle);
+}
+
+/* Offset writes extend the stream and zero-fill the gap, like a file. */
+static void nt_op_stream_offsets(struct kunit *test)
+{
+	struct nt_open_result out;
+	struct path s;
+	u16 slen;
+	char buf[16];
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\Off.txt:s", NT_DISPOSITION_CREATE_NEW,
+			      0, &out), 0);
+	s = out.handle->path;
+	slen = out.handle->stream_len;
+
+	/* Write two bytes at offset 4: the stream becomes six bytes. */
+	KUNIT_EXPECT_EQ(test,
+			nt_stream_write(&s, out.handle->stream, slen, 4, "XY",
+					2), 2);
+	KUNIT_EXPECT_EQ(test,
+			nt_stream_size(&s, out.handle->stream, slen), 6);
+
+	memset(buf, 0x7f, sizeof(buf));
+	KUNIT_EXPECT_EQ(test,
+			nt_stream_read(&s, out.handle->stream, slen, 0, buf, 6),
+			6);
+	KUNIT_EXPECT_EQ(test, buf[0], 0);	/* zero-filled gap */
+	KUNIT_EXPECT_EQ(test, buf[3], 0);
+	KUNIT_EXPECT_EQ(test, buf[4], 'X');
+	KUNIT_EXPECT_EQ(test, buf[5], 'Y');
+
+	/* Reading at end returns nothing. */
+	KUNIT_EXPECT_EQ(test,
+			nt_stream_read(&s, out.handle->stream, slen, 6, buf,
+				       6), 0);
+	nt_close(out.handle);
+}
+
+/* A non-$DATA stream type is refused, and bad stream names are rejected. */
+static void nt_op_stream_validation(struct kunit *test)
+{
+	struct nt_open_result out;
+	struct path base;
+
+	/* $INDEX_ALLOCATION and friends are NTFS-internal, not user data. */
+	KUNIT_EXPECT_EQ(test,
+			nt_op(test, "C:\\T.txt:idx:$INDEX_ALLOCATION",
+			      NT_DISPOSITION_CREATE_NEW, 0, &out), -EOPNOTSUPP);
+
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\V.txt:ok", NT_DISPOSITION_CREATE_NEW,
+			      0, &out), 0);
+	base = out.handle->path;
+
+	KUNIT_EXPECT_EQ(test, nt_stream_set(&base, "", 0, "x", 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, nt_stream_set(&base, "a:b", 3, "x", 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, nt_stream_set(&base, "a/b", 3, "x", 1), -EINVAL);
+
+	/* A stream larger than the store is refused before any allocation. */
+	KUNIT_EXPECT_EQ(test,
+			nt_stream_set(&base, "big", 3, NULL,
+				      NT_STREAM_MAX_SIZE + 1), -EFBIG);
+	nt_close(out.handle);
+}
+
 static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_create_new_absent),
 	KUNIT_CASE(nt_op_open_existing_absent),
@@ -613,7 +793,6 @@ static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_created_file_has_archive),
 	KUNIT_CASE(nt_op_create_directory),
 	KUNIT_CASE(nt_op_reserved_name_refused),
-	KUNIT_CASE(nt_op_stream_refused),
 	KUNIT_CASE(nt_op_exclusive_blocks_second),
 	KUNIT_CASE(nt_op_two_shared_readers),
 	KUNIT_CASE(nt_op_reader_conflicts_with_writer),
@@ -622,6 +801,12 @@ static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_delete_pending_blocks_open),
 	KUNIT_CASE(nt_op_delete_on_close_waits_for_last),
 	KUNIT_CASE(nt_op_access_check_enforces_mode),
+	KUNIT_CASE(nt_op_stream_create_write_read),
+	KUNIT_CASE(nt_op_stream_dispositions),
+	KUNIT_CASE(nt_op_stream_delete_on_close),
+	KUNIT_CASE(nt_op_stream_enumerate),
+	KUNIT_CASE(nt_op_stream_offsets),
+	KUNIT_CASE(nt_op_stream_validation),
 	{}
 };
 

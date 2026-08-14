@@ -169,6 +169,7 @@ static int nt_resolve_or_create(struct nt_task_ctx *ctx,
 				struct nt_path *final, u32 *result,
 				bool *needs_trunc)
 {
+	u32 keep = NT_RESOLVE_CASE_INSENSITIVE | NT_RESOLVE_ALLOW_STREAM;
 	struct nt_path parent;
 	u32 rflags, pflags;
 	bool created;
@@ -176,7 +177,7 @@ static int nt_resolve_or_create(struct nt_task_ctx *ctx,
 
 	*needs_trunc = false;
 
-	rflags = req->resolve_flags & NT_RESOLVE_CASE_INSENSITIVE;
+	rflags = req->resolve_flags & keep;
 	if (req->options & NT_CREATE_DIRECTORY)
 		rflags |= NT_RESOLVE_DIRECTORY;
 	if (!(req->options & NT_CREATE_OPEN_REPARSE))
@@ -222,7 +223,7 @@ static int nt_resolve_or_create(struct nt_task_ctx *ctx,
 		return -ENOENT;
 	}
 
-	pflags = (req->resolve_flags & NT_RESOLVE_CASE_INSENSITIVE) |
+	pflags = (req->resolve_flags & keep) |
 		 NT_RESOLVE_PARENT | NT_RESOLVE_DIRECTORY;
 	err = nt_path_resolve(ctx, parse, pflags, &parent);
 	if (err)
@@ -340,14 +341,169 @@ void nt_close(struct nt_open *handle)
 		return;
 
 	unlink = nt_share_close(handle);
-	if (unlink)
-		nt_unlink_handle(handle);
 
+	if (handle->stream) {
+		/*
+		 * A delete-on-close stream handle removes just its stream,
+		 * not the file it hangs off.  Stream handles are not in the
+		 * share table, so there is no last-close count here - the
+		 * stream goes when this handle closes.
+		 */
+		if (handle->delete_on_close)
+			nt_stream_remove(&handle->path, handle->stream,
+					 handle->stream_len);
+	} else if (unlink) {
+		nt_unlink_handle(handle);
+	}
+
+	kfree(handle->stream);
 	path_put(&handle->path);
 	nt_volume_put(handle->volume);
 	kfree(handle);
 }
 EXPORT_SYMBOL_GPL(nt_close);
+
+/*
+ * Apply a creation disposition to a named stream.
+ *
+ * The base file already exists by the time this runs; the disposition
+ * here decides the fate of the stream, exactly as it would for a file.
+ * Sets *@result and returns 0, or a negative errno.
+ */
+static int nt_stream_disposition(const struct path *base, const char *name,
+				 size_t name_len, u32 disposition, u32 *result)
+{
+	bool exists;
+	ssize_t sz;
+	int err;
+
+	sz = nt_stream_size(base, name, name_len);
+	if (sz < 0 && sz != -ENODATA)
+		return sz;
+	exists = sz >= 0;
+
+	switch (disposition) {
+	case NT_DISPOSITION_CREATE_NEW:
+		if (exists)
+			return -EEXIST;
+		err = nt_stream_set(base, name, name_len, NULL, 0);
+		*result = NT_RESULT_CREATED;
+		return err;
+	case NT_DISPOSITION_OPEN_EXISTING:
+		if (!exists)
+			return -ENOENT;
+		*result = NT_RESULT_OPENED;
+		return 0;
+	case NT_DISPOSITION_OPEN_ALWAYS:
+		if (exists) {
+			*result = NT_RESULT_OPENED;
+			return 0;
+		}
+		err = nt_stream_set(base, name, name_len, NULL, 0);
+		*result = NT_RESULT_CREATED;
+		return err;
+	case NT_DISPOSITION_CREATE_ALWAYS:
+		err = nt_stream_set(base, name, name_len, NULL, 0);
+		*result = exists ? NT_RESULT_OVERWRITTEN : NT_RESULT_CREATED;
+		return err;
+	case NT_DISPOSITION_TRUNCATE_EXISTING:
+		if (!exists)
+			return -ENOENT;
+		err = nt_stream_set(base, name, name_len, NULL, 0);
+		*result = NT_RESULT_OVERWRITTEN;
+		return err;
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Open or create a named data stream on a file.
+ *
+ * The base file is resolved (and created if the disposition creates and it
+ * is absent) without its unnamed $DATA stream ever being touched; the
+ * disposition then applies to the named stream.  The handle records the
+ * stream so reads and writes, and a delete-on-close, act on it rather than
+ * on the file.
+ */
+static int nt_create_stream(struct nt_task_ctx *ctx,
+			    struct nt_path_parse *parse,
+			    const struct nt_create_req *req,
+			    const char *fname, unsigned int flen,
+			    struct nt_open_result *out)
+{
+	const char *sname = parse->stream;
+	u16 slen = parse->stream_len;
+	struct nt_create_req base_req;
+	struct nt_open *handle;
+	struct nt_path base;
+	bool needs_trunc;
+	u32 bresult, result = 0;
+	bool creating;
+	int err;
+
+	/* Only real data streams are storable; $INDEX/$BITMAP are internal. */
+	if (parse->stream_type != NT_STREAM_TYPE_DATA)
+		return -EOPNOTSUPP;
+
+	creating = req->disposition == NT_DISPOSITION_CREATE_NEW ||
+		   req->disposition == NT_DISPOSITION_CREATE_ALWAYS ||
+		   req->disposition == NT_DISPOSITION_OPEN_ALWAYS;
+
+	/*
+	 * Resolve the base file.  A creating disposition ensures the base
+	 * exists (OPEN_ALWAYS - never truncating its data); a non-creating
+	 * one requires it.  Either way the base's own contents are left
+	 * alone; the stream is what the caller's disposition governs.
+	 */
+	base_req = *req;
+	base_req.disposition = creating ? NT_DISPOSITION_OPEN_ALWAYS :
+					  NT_DISPOSITION_OPEN_EXISTING;
+	base_req.options &= ~NT_CREATE_DIRECTORY;
+	base_req.resolve_flags |= NT_RESOLVE_ALLOW_STREAM;
+
+	err = nt_resolve_or_create(ctx, parse, &base_req, fname, flen, &base,
+				   &bresult, &needs_trunc);
+	if (err)
+		return err;
+
+	err = nt_check_access(&base.path, req->access);
+	if (err) {
+		nt_path_put(&base);
+		return err;
+	}
+
+	err = nt_stream_disposition(&base.path, sname, slen, req->disposition,
+				    &result);
+	if (err) {
+		nt_path_put(&base);
+		return err;
+	}
+
+	handle = kzalloc_obj(struct nt_open);
+	if (!handle) {
+		nt_path_put(&base);
+		return -ENOMEM;
+	}
+	handle->stream = kmemdup(sname, slen, GFP_KERNEL);
+	if (!handle->stream) {
+		kfree(handle);
+		nt_path_put(&base);
+		return -ENOMEM;
+	}
+	handle->stream_len = slen;
+	handle->path = base.path;
+	handle->volume = base.volume;
+	handle->access = req->access;
+	handle->share_mode = req->share;
+	handle->delete_on_close = req->options & NT_CREATE_DELETE_ON_CLOSE;
+	INIT_LIST_HEAD(&handle->node);
+	/* Stream handles are not registered in the share table; see nt_close. */
+
+	out->handle = handle;
+	out->result = result;
+	return 0;
+}
 
 /**
  * nt_create - create or open a file by NT path
@@ -390,19 +546,25 @@ int nt_create(struct nt_task_ctx *ctx, const char *name,
 	/*
 	 * A Win32 reserved device name (CON, NUL, ...) refers to a device,
 	 * not a file on this volume; refuse it rather than create an on-disk
-	 * file CreateFile would never have made.  A stream create is a
-	 * separate feature and is refused rather than half-handled.
+	 * file CreateFile would never have made.
 	 */
 	if (parse.flags & NT_PARSE_RESERVED_NAME) {
 		err = -EPERM;
 		goto out_free;
 	}
+
+	nt_final_component(&parse, &fname, &flen);
+
+	/* "file:stream" opens a named data stream on the base file. */
 	if (parse.flags & NT_PARSE_HAS_STREAM) {
-		err = -EOPNOTSUPP;
+		if (flen == 0)
+			err = -EINVAL;	/* a volume root has no streams */
+		else
+			err = nt_create_stream(ctx, &parse, req, fname, flen,
+					       out);
 		goto out_free;
 	}
 
-	nt_final_component(&parse, &fname, &flen);
 	if (flen == 0) {
 		/* The path names a volume root: only an open is meaningful. */
 		switch (req->disposition) {

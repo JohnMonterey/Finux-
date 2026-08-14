@@ -207,6 +207,16 @@ enum nt_path_type {
 #define NT_STREAM_TYPE_BITMAP		0x000000B0	/* $BITMAP */
 
 /*
+ * Largest named data stream this subsystem stores.  A named stream lives
+ * in an extended attribute (the "xattr fast path" for small streams), so
+ * it is bounded by what an xattr can hold rather than by the file size.
+ * Streams larger than this need the backing store that is future work;
+ * the overwhelmingly common named streams - Zone.Identifier and other
+ * small tags - fit with room to spare.
+ */
+#define NT_STREAM_MAX_SIZE		65536
+
+/*
  * ---------------------------------------------------------------------
  * Create / open  (layer: NT kernel - NtCreateFile / Win32 CreateFile)
  * ---------------------------------------------------------------------

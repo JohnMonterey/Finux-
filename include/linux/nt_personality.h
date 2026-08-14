@@ -472,9 +472,13 @@ struct nt_create_req {
  * @volume:  volume the path was resolved through; holds a reference
  * @share:   per-inode share-control block this open is registered in
  * @node:    link in nt_share::opens
+ * @stream:  named data stream this handle refers to, or NULL for the file
+ *           itself; owned by the handle
+ * @stream_len: length of @stream
  * @access:  NT_ACCESS_* granted to this handle
  * @share_mode: NT_SHARE_* this handle grants others
- * @delete_on_close: unlink the file when the last handle closes
+ * @delete_on_close: on the last close, delete the file - or, for a stream
+ *           handle, just that stream
  *
  * This is the NT file object.  It is created by nt_create() and released
  * by nt_close(); a caller must call nt_close() exactly once, never
@@ -485,6 +489,8 @@ struct nt_open {
 	struct nt_volume	*volume;
 	struct nt_share		*share;
 	struct list_head	node;
+	char			*stream;
+	u16			stream_len;
 	u32			access;
 	u32			share_mode;
 	bool			delete_on_close;
@@ -527,6 +533,29 @@ int nt_set_reparse_point(const struct path *path, const void *buf,
 			 size_t size);
 ssize_t nt_get_reparse_point(const struct path *path, void *buf, size_t size);
 int nt_delete_reparse_point(const struct path *path);
+
+/* --- alternate data streams (fs/ntpers/stream.c) --------------------- */
+
+/*
+ * Callback for nt_stream_list().  @name is the stream name (not NUL
+ * terminated), @size its length in bytes.  A non-zero return stops the
+ * enumeration and is returned by nt_stream_list().
+ */
+typedef int (*nt_stream_iter_fn)(void *ctx, const char *name,
+				 size_t name_len, loff_t size);
+
+int nt_stream_set(const struct path *path, const char *name, size_t name_len,
+		  const void *buf, size_t size);
+ssize_t nt_stream_read(const struct path *path, const char *name,
+		       size_t name_len, loff_t offset, void *buf, size_t len);
+ssize_t nt_stream_write(const struct path *path, const char *name,
+			size_t name_len, loff_t offset, const void *buf,
+			size_t len);
+int nt_stream_remove(const struct path *path, const char *name,
+		     size_t name_len);
+ssize_t nt_stream_size(const struct path *path, const char *name,
+		       size_t name_len);
+int nt_stream_list(const struct path *path, nt_stream_iter_fn fn, void *ctx);
 
 /* --- subsystem init (fs/ntpers/main.c) ------------------------------- */
 

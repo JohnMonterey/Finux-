@@ -50,9 +50,9 @@ each behaviour is implemented in exactly one of them.
     +---------------------------------------------------------------+
     | 3. NT filesystem personality    DOS attributes, NT timestamps, |  fs/ntpers/
     |                                 security descriptors, file IDs |  meta.c
-    |                                 streams, reparse points,       |  (streams and
-    |                                 share modes                    |  locks: 4-5)
-    +---------------------------------------------------------------+
+    |                                 create/open, sharing, streams, |  open.c
+    |                                 reparse points                 |  share.c
+    +---------------------------------------------------------------+  stream.c
     | 2. Linux VFS                    dentries, inodes, mounts,      |  fs/
     |                                 struct path, struct file       |
     +---------------------------------------------------------------+
@@ -441,7 +441,8 @@ Stage                                          State
 4. Create/open, dispositions, collisions      implemented
 4. Share modes, delete-on-close, delete-pending implemented
 4. Reparse points (tag + payload storage)     stored and reported
-4. Alternate streams, 8.3 short names          parsed only; not stored
+4. Alternate data streams (named $DATA)       stored, xattr-backed
+4. 8.3 short names                             parsed only; not generated
 5. Byte-range locks                           designed; not implemented
 6. System volume layout (C:\Windows, ...)     volume concept implemented
 7. Win32 subsystem hooks                      partial; see below
@@ -603,15 +604,32 @@ What stages 4 and 5 will need
 
 Recorded here so the design is not lost.
 
-Alternate data streams (stage 4)
---------------------------------
+Alternate data streams
+----------------------
 
-A named stream needs a real backing object, not an xattr: xattrs are
-size-limited and an alternate data stream is not.  The plan is a hidden
-per-file store with an xattr fast path for small streams, keeping the
-unnamed ``$DATA`` stream as the file itself.  This is the last piece of
-stage 4 still parse-only; reparse points, which the parser also only
-classified before, are now stored and reported (see just above).
+An NTFS file is a set of byte streams, not one.  The unnamed ``$DATA``
+stream is the file's ordinary contents and stays the file itself; a named
+stream - ``file.txt:name`` - is an independent stream attached to the same
+file.  These are now stored (fs/ntpers/stream.c): each named stream lives
+in a ``user.nt.ads.`` xattr, the "xattr fast path for small streams" the
+plan called for, and ``nt_create()`` opens ``base:stream`` by resolving
+(or creating) the base file without touching its data and applying the
+disposition to the stream.  ``nt_stream_read()`` / ``nt_stream_write()``
+carry an offset, so the interface reads as a byte stream even though the
+backing is a whole-value xattr; a partial write is a read-modify-write.
+``nt_stream_list()`` enumerates a file's named streams for
+``FindFirstStreamW``.
+
+Two bounds are honest limits of the xattr backing rather than of NTFS.  A
+stream cannot exceed ``NT_STREAM_MAX_SIZE`` - a stream larger than an
+xattr can hold needs the hidden per-file backing store that is still
+future work, and a write past the bound is refused, not truncated.  And a
+named-stream open is not registered in the share table: sharing is
+enforced on the file's main data stream, and per-stream sharing is not yet
+modelled, so a delete-on-close stream handle removes its stream when it
+closes rather than tracking a last-close count.  The last stage-4 item
+still parse-only is 8.3 short-name generation, which needs a
+per-directory uniqueness index and is a legacy-compatibility feature.
 
 Reparse points need a tag plus an arbitrary payload, so a Linux symlink
 alone is not sufficient.  These are now stored (fs/ntpers/meta.c): a
