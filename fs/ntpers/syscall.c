@@ -302,16 +302,26 @@ u32 nt_file_read(struct nt_task_ctx *ctx, u32 handle, s64 offset,
 	if (S_ISDIR(file_inode(open->file)->i_mode))
 		return STATUS_INVALID_DEVICE_REQUEST;
 
-	if (use_fpos)
+	if (use_fpos) {
+		/*
+		 * The current-position path is a read-modify-write of the shared
+		 * handle's f_pos, so serialise it under the file's position lock -
+		 * the way fdget_pos() does for a Linux read()/write() - or two
+		 * threads sharing this handle both advance from the same start and
+		 * read the same bytes.  The explicit-offset path below touches no
+		 * f_pos and stays lock-free.
+		 */
+		mutex_lock(&open->file->f_pos_lock);
 		pos = open->file->f_pos;
-
-	n = kernel_read(open->file, buf, len, &pos);
+		n = kernel_read(open->file, buf, len, &pos);
+		if (n >= 0)
+			open->file->f_pos = pos;
+		mutex_unlock(&open->file->f_pos_lock);
+	} else {
+		n = kernel_read(open->file, buf, len, &pos);
+	}
 	if (n < 0)
 		return nt_errno_to_status(n);
-
-	/* A current-position read advances the handle's position by what it moved. */
-	if (use_fpos)
-		open->file->f_pos = pos;
 
 	if (n == 0 && len > 0)
 		return STATUS_END_OF_FILE;
@@ -383,17 +393,29 @@ u32 nt_file_write(struct nt_task_ctx *ctx, u32 handle, s64 offset,
 	if (S_ISDIR(file_inode(open->file)->i_mode))
 		return STATUS_INVALID_DEVICE_REQUEST;
 
-	if (append)
-		pos = i_size_read(file_inode(open->file));
-	else if (use_fpos)
-		pos = open->file->f_pos;
-
-	n = kernel_write(open->file, buf, len, &pos);
+	if (use_fpos || append) {
+		/*
+		 * Both the current-position write and the append write update the
+		 * shared handle's f_pos, so serialise them under the file's
+		 * position lock, mirroring how fdget_pos() serialises a Linux
+		 * write() (append included) - two threads sharing this handle must
+		 * not race on f_pos.  The explicit-offset path below touches no
+		 * f_pos and stays lock-free.
+		 */
+		mutex_lock(&open->file->f_pos_lock);
+		if (append)
+			pos = i_size_read(file_inode(open->file));
+		else
+			pos = open->file->f_pos;
+		n = kernel_write(open->file, buf, len, &pos);
+		if (n >= 0)
+			open->file->f_pos = pos;
+		mutex_unlock(&open->file->f_pos_lock);
+	} else {
+		n = kernel_write(open->file, buf, len, &pos);
+	}
 	if (n < 0)
 		return nt_errno_to_status(n);
-
-	if (use_fpos || append)
-		open->file->f_pos = pos;
 
 	*bytes_written = n;
 	return STATUS_SUCCESS;
@@ -761,12 +783,20 @@ u32 NtReadFile(u64 file_handle, u64 event, u64 apc_routine, u64 apc_context,
 		st = STATUS_ACCESS_VIOLATION;
 	kvfree(kbuf);
 
-	if (st == STATUS_SUCCESS || st == STATUS_END_OF_FILE) {
-		u64 information = st == STATUS_SUCCESS ? n : 0;
-
-		if (nt_put_io_status(io_status_block, st, information))
-			return STATUS_ACCESS_VIOLATION;
-	}
+	/*
+	 * The core ran, so the request completed - with success, EOF, or a
+	 * failure NTSTATUS - and NT fills the IoStatusBlock on completion.
+	 * Report the outcome through it in every one of those cases, not just
+	 * on success/EOF as before, so a caller that reads only the IoStatusBlock
+	 * sees the failure too.  Information is the byte count on success and
+	 * zero on EOF or failure.  The line is drawn at the core call: the
+	 * pre-dispatch argument-validation and marshalling failures above return
+	 * before any I/O was attempted and leave the IoStatusBlock untouched, as
+	 * NT does for a request it never began.
+	 */
+	if (nt_put_io_status(io_status_block, st,
+			     st == STATUS_SUCCESS ? n : 0))
+		return STATUS_ACCESS_VIOLATION;
 	return st;
 }
 
@@ -821,10 +851,18 @@ u32 NtWriteFile(u64 file_handle, u64 event, u64 apc_routine, u64 apc_context,
 	st = nt_file_write(ctx, (u32)file_handle, offset, kbuf, xfer, &n);
 	kvfree(kbuf);
 
-	if (st == STATUS_SUCCESS) {
-		if (nt_put_io_status(io_status_block, st, n))
-			return STATUS_ACCESS_VIOLATION;
-	}
+	/*
+	 * The core ran, so the request completed - with success or a failure
+	 * NTSTATUS - and NT fills the IoStatusBlock on completion.  Report the
+	 * outcome through it either way, not just on success as before.
+	 * Information is the byte count on success and zero on failure.  As in
+	 * NtReadFile the line is drawn at the core call: the pre-dispatch
+	 * validation and copy-in failures above return before any I/O was
+	 * attempted and leave the IoStatusBlock untouched.
+	 */
+	if (nt_put_io_status(io_status_block, st,
+			     st == STATUS_SUCCESS ? n : 0))
+		return STATUS_ACCESS_VIOLATION;
 	return st;
 }
 

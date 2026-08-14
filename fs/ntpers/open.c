@@ -723,6 +723,21 @@ int nt_create(struct nt_task_ctx *ctx, const char *name,
 		 * this last step leaves the file as it found it rather than
 		 * unlinking one a racing opener may now hold.  handle->file is
 		 * NULL on this path, so there is nothing to fput.
+		 *
+		 * Orphaned-file edge: when this same call created the file fresh
+		 * (result == NT_RESULT_CREATED), that empty file is left on disk
+		 * even though the create as a whole returns failure - NtCreateFile
+		 * hands back no handle, but the name now exists.  This is left
+		 * deliberately, not fixed by unlinking here.  Between nt_share_open()
+		 * above and this failure the file is a normal, share-registered
+		 * object, so a concurrent opener may already hold it; rolling it
+		 * back would unlink a file another handle legitimately owns - the
+		 * exact race the sharing-conflict and truncation-failure paths
+		 * avoid.  The subsystem only ever removes a file through the
+		 * delete-on-close last-close count, never as create rollback, and
+		 * keeping that single rule is worth more than reclaiming a rare,
+		 * benign empty file (nt_open_file_object() fails here only on an
+		 * unusual dentry_open(), e.g. -ENFILE).
 		 */
 		nt_share_close(handle);
 		path_put(&handle->path);

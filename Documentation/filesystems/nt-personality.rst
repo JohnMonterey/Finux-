@@ -492,11 +492,192 @@ existing in-kernel NT file operations live - is what a userspace Win32
 stack (the Wine or ReactOS DLLs) would sit on top of.  Building the loader
 first means that surface has something concrete to plug into.
 
+The NT system-call surface
+==========================
+
+The loader leaves a native PE running with the register file and ``%gs`` an NT
+program expects, but running is only half of it: the program's first act is a
+``syscall``, and on the other side of that instruction has to be the NT
+service it named, not a Linux one.  This section is that other side - the path
+a request takes from the ``syscall`` frame down to a real file and back.  It is
+the "missing middle" the loader section named, built so a userspace Win32 stack
+has a concrete surface to sit on.
+
+The Object Manager handle table
+-------------------------------
+
+An NT process never holds an object; it holds a HANDLE and names the object
+through it.  ``fs/ntpers/handle.c`` is that indirection: the map from a HANDLE
+to the ``struct nt_open`` - the file object ``nt_create()`` produced - that it
+stands for.
+
+The values follow the Windows convention exactly, because software inspects
+them.  A handle is its table index shifted up by two: the low two bits are tag
+bits Win32 reserves for itself, so the allocator only ever hands out values
+with those bits clear, and zero is the null handle and is never allocated -
+which is what lets a zeroed HANDLE field read back safely as "no handle".  The
+pseudo-handles Windows layers on top (``GetCurrentProcess()`` and its kind, the
+negative values) live at the far end of the range; the allocator is capped at
+the same 16,777,216 (2^24) handles Windows allows a process, so its largest
+value stays far below them and a later stage can add them without renumbering
+anything.  The table itself is an allocating xarray, which is exactly an NT
+handle table's shape - a sparse integer-keyed map that allocates its own keys,
+looks them up under RCU on the hot path, and stays consistent under threads
+racing to open and close - so it carries no lock of its own.
+
+The table lives inside ``struct nt_task_ctx``, which hangs off
+``struct fs_struct``, so it is shared and copied on exactly the terms the
+current directory is: threads of a process share one, and ``CLONE_FS`` shares
+it across processes.  That matches Windows, where a handle is valid in every
+thread of the process.  It is destroyed on the last reference to the context,
+which is process exit, and destruction closes every handle still open, so an
+exiting process cannot leak the mount and dentry references its open files pin.
+
+One caveat is stated in the code rather than hidden.  A lookup returns a
+*borrowed* pointer: an ``nt_open`` has no reference count of its own yet, so a
+looked-up object is valid only until that handle is closed, and the dispatch
+layer must not use one across a concurrent close of the same handle.  Giving
+``nt_open`` a real refcount - the job NT does with
+``ObReferenceObjectByHandle()`` - is future work.  Closing itself is already
+race-safe: the removal is one atomic ``xa_erase()``, so two threads closing the
+same handle cannot both reach the object's teardown - one erases and closes it,
+the other gets ``STATUS_INVALID_HANDLE``.
+
+The NT file calls
+-----------------
+
+``fs/ntpers/syscall.c`` holds the NtCreateFile / NtReadFile / ... surface, and
+every call in it is two functions - the same split ``fs/binfmt_pe.c`` draws
+between a pure ``pe_parse_headers()`` and an I/O-driving ``load_pe_binary()``:
+
+* a *core* - ``nt_file_create()`` and its kin - that works purely on in-kernel
+  data: a decoded UTF-8 path, kernel buffers, a ``struct nt_task_ctx``.  It
+  does the real work - ``nt_create()``, the handle table, the VFS read and
+  write - and returns an NTSTATUS.  These are what the KUnit suite drives,
+  against a tmpfs fixture, with no user memory in sight;
+* a *wrapper* - ``NtCreateFile()`` and its kin - the system-service entry
+  point.  It copies the NT ABI structures in and out of user memory, transcodes
+  the UTF-16 ObjectName to the UTF-8 path the core wants, and calls the core.
+
+The ABI structures must match the 64-bit Windows layout byte for byte, or a
+native PE handed one would read the wrong field, so ``static_assert`` guards pin
+every size and every padding-produced offset - a mistake in a struct definition
+is a build failure, not a runtime corruption.  The ObjectName is a
+UNICODE_STRING (a byte length and a user pointer to that many UTF-16LE code
+units, not necessarily NUL terminated); it is transcoded with
+``utf16s_to_utf8s()`` in little-endian, into a buffer sized so the conversion
+can never truncate, and the parser then applies the real path-length limit.
+NTSTATUS is the currency throughout, and the errno the VFS and the create and
+share layers speak is translated to it in exactly one place,
+``nt_errno_to_status()``.
+
+What is not done is said plainly, as ``STATUS_NOT_IMPLEMENTED`` rather than a
+silent wrong answer:
+
+* ``FILE_SUPERSEDE`` - it resets a file and reports ``FILE_SUPERSEDED``, which
+  ``nt_create()`` does not do, so it is refused rather than quietly treated as
+  an overwrite;
+* a non-zero ``RootDirectory`` in the OBJECT_ATTRIBUTES - handle-relative opens
+  are future work, refused rather than ignored;
+* every ``NtQueryInformationFile`` class but FileBasicInformation and
+  FileStandardInformation.
+
+The allocation-size hint and the extended-attribute buffer are accepted and
+ignored, and ``NtTerminateProcess`` implements only self-termination (the
+current-process pseudo-handle), refusing a handle to any other process.
+
+ABI-real dispatch
+-----------------
+
+The two conventions - Linux's and Windows' - meet on one instruction, so a task
+carries a sticky flag, ``nt_syscall_mode``, that decides which one its
+``syscall`` means.  It is a plain word in ``task_struct``, tested once at the
+top of the syscall entry path, so an ordinary Linux task pays a single
+predicted-not-taken branch and a kernel without ``CONFIG_NT_FS_PERSONALITY``
+pays nothing at all.  The PE loader sets it so a Windows image is in NT mode
+from its first instruction; ``prctl(PR_SET_NT_SYSCALL_MODE)`` is the test entry
+point.
+
+When the flag is set the register file holds the Windows x64 system-service
+convention, not the Linux one:
+
+.. code-block:: none
+
+    RAX          the NT service number (read from ORIG_AX / the captured
+                 guest number, not the AX slot the entry path overwrote)
+    R10          argument 1   (the ntdll stub's `mov r10, rcx`)
+    RDX, R8, R9  arguments 2, 3, 4
+    [RSP+0x28+]  arguments 5, 6, ... on the user stack, above the return
+                 address and the four-slot Win64 register shadow space
+    RAX          the NTSTATUS result on return
+
+``nt_do_syscall()`` (``fs/ntpers/dispatch.c``) reads that, selects the service
+from a table indexed by the NT service numbers, gathers exactly as many stack
+arguments as the chosen service takes, invokes it, and writes the NTSTATUS
+back.  The dispatcher is architecture-neutral apart from the spelling of "read
+this register out of ``struct pt_regs``", which is the whole of the tiny shim in
+``nt_dispatch.h``; that is what lets one dispatcher serve both entry hooks - the
+native x86-64 path in ``arch/x86/entry/syscall_64.c`` and the UML/x86-64 guest
+in ``arch/um/kernel/skas/syscall.c``, whose register and stack layout is
+identical.  Each hook branches to ``nt_do_syscall()`` before the Linux syscall
+entry work, still bracketing it with the same ``enter_from_user_mode()`` /
+``syscall_exit_to_user_mode()`` bookkeeping the Linux path uses.
+
+.. warning::
+   NT service numbers are a namespace disjoint from Linux syscall numbers, so
+   the entry hooks branch to the NT dispatcher *before* the Linux syscall entry
+   work runs.  NT-mode syscalls are therefore neither filtered by Linux seccomp
+   nor recorded by Linux audit: a sandbox whose policy is written in terms of
+   Linux syscall numbers does not constrain what an NT-mode task's services do.
+   A seccomp-based NT policy is future work.
+
+The PE as an NT process
+-----------------------
+
+``pe_setup_nt_process()`` in ``fs/binfmt_pe.c`` turns a just-mapped image into
+an NT process.  It puts the task into NT syscall mode, sets the NT personality
+so pathnames resolve by Windows rules (case-insensitive), and allocates a
+single anonymous, zero-filled page to hold a minimal TEB and PEB: the NT_TIB
+stack bounds, the TEB's self-pointer, the pointer from the TEB to the PEB, and
+the image base in the PEB - the few fields a native PE reads to find itself.
+``%gs`` is then pointed at the TEB, through ``do_arch_prctl_64()`` on native
+x86-64 and the guest's ``arch_prctl`` on UML, so ``gs:[...]`` resolves against
+the TEB on both.
+
+What is deliberately absent is the rest of the Win32 startup contract: there is
+no import resolution (a self-contained image that makes its own NT syscalls
+runs; one that calls into ``ntdll``/``kernel32`` has nothing to call), no full
+``RtlUserThreadStart`` entry protocol, and no ``RTL_USER_PROCESS_PARAMETERS``
+block, so a normal EXE's CRT startup would have no command line or environment
+to read.  Those belong to the userspace Win32 stack, not the kernel.
+
+How it all connects
+-------------------
+
+End to end, the pieces make one path.  A native PE is an NT process from its
+first instruction because the loader made it one; it issues
+``NtCreateFile("C:\...")``, the drive letter resolves through the volume layer
+to a real Linux mount, the handle lands in the fs_struct-anchored table, and
+``NtWriteFile`` moves bytes through an ordinary ``struct file``.  When the
+process closes the handle and an ordinary Linux program opens the same path -
+``C:\file`` maps to ``/file`` on the root volume - the bytes are exactly what
+the Windows binary wrote.  A Windows program created a real file that Linux
+sees, with no Wine prefix and no translation daemon anywhere in the path.
+
+This is the surface a userspace Win32 stack sits on.  The Wine or ReactOS
+``ntdll`` and ``kernel32`` would provide ``CreateFileW`` and its kin,
+translating them into the NT services here; the kernel provides the namespace
+those calls resolve against and the system-call surface they reach it through.
+The loader, the handle table, the NT file calls and this dispatch path are the
+concrete thing those DLLs plug into.
+
 Testing
 =======
 
-KUnit, covering the parser, the reserved-name rules, the volume registry
-and resolution::
+KUnit, covering the parser, the reserved-name rules, the volume registry,
+resolution, the create/open path, the Object Manager handle table
+(``ntpers-handle``) and the NT file system calls exercised through their cores
+(``ntpers-syscall``)::
 
     tools/testing/kunit/kunit.py run --kunitconfig fs/ntpers/tests
 
@@ -510,8 +691,18 @@ case-insensitive lookup against a live filesystem::
 
     make -C tools/testing/selftests TARGETS=filesystems/nt_personality run_tests
 
-An end-to-end selftest that builds a real PE on disk and execve()s it,
-checking that the loader ran it::
+An end-to-end selftest that drives the real ``syscall`` path: a child enters NT
+syscall mode and, from a pure assembly thunk that makes no Linux system call,
+runs NtCreateFile / NtWriteFile / NtQueryInformationFile / NtReadFile and exits
+through NtTerminateProcess.  It skips on a kernel without the personality, and
+the same static binary doubles as a UML ``init``::
+
+    make -C tools/testing/selftests TARGETS=nt_syscall run_tests
+
+End-to-end selftests that build real native PEs on disk and execve() them:
+``binfmt_pe_test`` checks the loader ran the image, and ``binfmt_pe_nt_io_test``
+has the loaded PE do genuine file I/O entirely through NT system calls and then
+verifies the resulting file from the ordinary Linux side::
 
     make -C tools/testing/selftests TARGETS=binfmt_pe run_tests
 
@@ -537,6 +728,12 @@ Stage                                          State
 7. Win32 subsystem hooks                      partial; see below
 8. PE loader (binfmt_pe)                       loads static native PE32+;
                                               see "Loading PE executables"
+9. NT Object Manager handle table             implemented
+9. NT file calls (NtCreateFile and kin)       implemented; create/open,
+                                              read/write, close, query
+9. ABI-real syscall dispatch (x86-64/UML)     implemented; seccomp/audit
+                                              bypass, see below
+9. PE runs as an NT process                   implemented; minimal TEB/PEB
 ============================================  =========================
 
 File metadata
