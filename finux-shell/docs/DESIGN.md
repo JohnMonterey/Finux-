@@ -111,6 +111,38 @@ segfault, and either half configures cleanly alone, so it is an upstream
 interaction bug. The portable reference pipeline is comfortably fast enough for
 shell chrome. Measure before caring.
 
+## The Start menu
+
+Three columns, drawn in the order Windows draws them: an icon rail, the
+alphabetical app list, and the tile panel. The rail and list share a
+background; the panel sits on its own slightly different surface, which is
+what gives the menu its two-tone look.
+
+The tile grid is a first-fit packer over six cells. A "cell" is the small-tile
+footprint; medium tiles are 2x2 cells, wide 4x2, large 4x4, each absorbing the
+gutters it spans. The panel width is *derived* from the grid rather than chosen
+independently -- it exists to hold exactly six cells across -- so three medium
+tiles fill a row exactly. `test_startmenu_render` asserts that arithmetic
+directly, because an off-by-one in the gutter count produces a menu that looks
+plausible in isolation while matching no Windows layout at all.
+
+Windows lets users drag tiles anywhere and stores explicit positions. Until
+there is a tile-layout store to read, packing in declaration order reproduces
+the default arrangement, which is what a fresh install shows.
+
+Tiles that run past the bottom edge are drawn and clipped rather than skipped.
+Skipping let a later, shorter tile jump ahead of one that overflowed, silently
+reordering the last visible row.
+
+## Themes
+
+Light is the default, because that is what Windows 10 ships. The two palettes
+differ in more than lightness: the hover and press layers are translucent
+*white* over a dark bar and translucent *black* over a light one, and the Start
+button takes the accent colour only in the light theme. Storing those layers
+with alpha rather than pre-flattening them is what lets one widget draw
+correctly under both.
+
 ## What is deliberately missing
 
 Placeholders that must be replaced, and are marked as such in the source:

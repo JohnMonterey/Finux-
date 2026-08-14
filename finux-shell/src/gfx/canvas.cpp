@@ -70,6 +70,64 @@ void Canvas::fillRoundedRect(Rect r, double radius, Color c) {
   ctx_.fill_round_rect(BLRoundRect(r.x, r.y, r.w, r.h, radius));
 }
 
+void Canvas::fillLinearGradient(Rect r, Point from, Point to, Color a,
+                                Color b) {
+  ensureContext();
+  const Rect clipped = r.intersected(clip_);
+  if (clipped.empty()) return;
+  BLGradient gradient(BLLinearGradientValues(from.x, from.y, to.x, to.y));
+  gradient.add_stop(0.0, toBl(a));
+  gradient.add_stop(1.0, toBl(b));
+  ctx_.set_fill_style(gradient);
+  ctx_.fill_rect(toBl(clipped));
+}
+
+void Canvas::fillCircle(Point center, int radius, Color c) {
+  ensureContext();
+  if (radius <= 0 || c.transparent()) return;
+  ctx_.set_fill_style(toBl(c));
+  ctx_.fill_circle(BLCircle(center.x + 0.5, center.y + 0.5, radius));
+}
+
+void Canvas::strokeCircle(Point center, int radius, double thickness, Color c) {
+  ensureContext();
+  if (radius <= 0 || thickness <= 0.0 || c.transparent()) return;
+  ctx_.set_stroke_style(toBl(c));
+  ctx_.set_stroke_width(thickness);
+  ctx_.stroke_circle(BLCircle(center.x + 0.5, center.y + 0.5, radius));
+}
+
+void Canvas::strokeArc(Point center, int radius, double startDeg,
+                       double sweepDeg, double thickness, Color c) {
+  ensureContext();
+  if (radius <= 0 || thickness <= 0.0 || c.transparent()) return;
+  constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+  ctx_.set_stroke_style(toBl(c));
+  ctx_.set_stroke_width(thickness);
+  ctx_.set_stroke_cap(BL_STROKE_CAP_POSITION_START, BL_STROKE_CAP_ROUND);
+  ctx_.set_stroke_cap(BL_STROKE_CAP_POSITION_END, BL_STROKE_CAP_ROUND);
+  ctx_.stroke_arc(BLArc(center.x + 0.5, center.y + 0.5, radius, radius,
+                        startDeg * kDegToRad, sweepDeg * kDegToRad));
+}
+
+void Canvas::strokeLine(Point a, Point b, double thickness, Color c) {
+  ensureContext();
+  if (thickness <= 0.0 || c.transparent()) return;
+  ctx_.set_stroke_style(toBl(c));
+  ctx_.set_stroke_width(thickness);
+  ctx_.set_stroke_cap(BL_STROKE_CAP_POSITION_START, BL_STROKE_CAP_ROUND);
+  ctx_.set_stroke_cap(BL_STROKE_CAP_POSITION_END, BL_STROKE_CAP_ROUND);
+  ctx_.stroke_line(BLLine(a.x + 0.5, a.y + 0.5, b.x + 0.5, b.y + 0.5));
+}
+
+void Canvas::fillTriangle(Point a, Point b, Point p3, Color c) {
+  ensureContext();
+  if (c.transparent()) return;
+  ctx_.set_fill_style(toBl(c));
+  ctx_.fill_triangle(BLTriangle(a.x + 0.5, a.y + 0.5, b.x + 0.5, b.y + 0.5,
+                                p3.x + 0.5, p3.y + 0.5));
+}
+
 void Canvas::blit(Point at, const Image& src) {
   ensureContext();
   if (!src.valid()) return;

@@ -51,6 +51,25 @@ class Canvas {
 
   void fillRoundedRect(Rect r, double radius, Color c);
 
+  // Two-stop linear gradient. The shell proper uses flat fills; this exists
+  // for the desktop backdrop, where a single colour reads as obviously fake.
+  void fillLinearGradient(Rect r, Point from, Point to, Color a, Color b);
+
+  // Glyph primitives.
+  //
+  // The shell draws its own chrome glyphs -- the search magnifier, the Cortana
+  // ring, the power symbol, the settings gear -- because the Windows icon set
+  // is not redistributable (see docs/ASSETS.md). These are the shapes those
+  // glyphs are built from. Centres and radii are integral for the same reason
+  // the rest of the geometry is: a half-pixel circle centre reads as a blurry
+  // smudge at 16px.
+  void fillCircle(Point center, int radius, Color c);
+  void strokeCircle(Point center, int radius, double thickness, Color c);
+  void strokeArc(Point center, int radius, double startDeg, double sweepDeg,
+                 double thickness, Color c);
+  void strokeLine(Point a, Point b, double thickness, Color c);
+  void fillTriangle(Point a, Point b, Point p3, Color c);
+
   void blit(Point at, const Image& src);
   void blit(Point at, const Image& src, Rect srcRect);
 

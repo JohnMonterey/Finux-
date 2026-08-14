@@ -22,6 +22,7 @@ finux_add_test(test_pixdiff)
 finux_add_test(test_canvas_interleave)
 finux_add_test(test_text)
 finux_add_test(test_taskbar_render)
+finux_add_test(test_startmenu_render)
 
 # End-to-end check against a real window manager. Covers strut reservation and
 # window placement, which offscreen rendering tests cannot see.

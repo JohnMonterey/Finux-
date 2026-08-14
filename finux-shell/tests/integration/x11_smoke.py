@@ -24,11 +24,12 @@ import time
 
 SKIP = 77
 BAR_HEIGHT = 40
+START_BUTTON_WIDTH = 48
 SCREEN_W, SCREEN_H = 1280, 800
 
-TASKBAR_BG = (31, 31, 31)
+# The shell defaults to the light theme, as Windows 10 ships.
+TASKBAR_BG = (243, 243, 243)
 ACCENT = (0, 120, 215)
-ICON_TILE = (0, 90, 158)
 
 
 def skip(reason):
@@ -227,13 +228,31 @@ def main():
             start_ink = image.count_not(TASKBAR_BG, 0, 48, top, image.height)
             check(start_ink > 0, f"start button drew ({start_ink} px)")
 
-            runs = image.runs_of(ACCENT, image.height - 2)
+            # One accent run per running window. Buttons are icon-only by
+            # default ("combine taskbar buttons: always"), so the runs are
+            # narrow, but there must still be exactly one per client.
+            #
+            # The Start button is accent-filled in the light theme and spans
+            # the bar's full height, so it also matches on this row; skip it
+            # rather than counting it as an indicator.
+            runs = [(a, b) for a, b in image.runs_of(ACCENT, image.height - 2)
+                    if a >= START_BUTTON_WIDTH]
             check(len(runs) == 2,
                   f"one running indicator per client window (got {len(runs)}, "
                   f"want 2)")
             for index, (x0, x1) in enumerate(runs):
-                check(image.pixel(x0 + 2, top + 20) == ICON_TILE,
-                      f"task button {index} drew its icon tile")
+                icon_ink = image.count_not(TASKBAR_BG, x0, x1 + 1, top + 8,
+                                           top + 32)
+                check(icon_ink > 0,
+                      f"task button {index} drew no icon above its indicator")
+
+            # The Start button carries the accent colour in the light theme.
+            start_accent = sum(
+                1 for y in range(top, image.height)
+                for x in range(0, START_BUTTON_WIDTH)
+                if image.pixel(x, y) == ACCENT)
+            check(start_accent > 200,
+                  f"start button is not accent-filled ({start_accent} px)")
 
             clock_ink = image.count_not(TASKBAR_BG, 1195, image.width - 8, top,
                                         image.height)

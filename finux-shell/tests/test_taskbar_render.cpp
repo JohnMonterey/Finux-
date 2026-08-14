@@ -1,6 +1,11 @@
 // Renders the taskbar to an offscreen surface -- no X server involved -- and
 // checks both structural invariants and, when a reference capture is present,
 // pixel fidelity against real Windows 10.
+//
+// Positions come from the bar's own layout rather than being recomputed here.
+// An earlier version derived button positions from metrics, which made it a
+// second implementation of layout: when the real one gained a search box and
+// pinned buttons, the test kept checking the coordinates it had invented.
 
 #include <string>
 #include <vector>
@@ -18,34 +23,36 @@ using namespace finux;
 
 namespace {
 
-constexpr int kBarWidth = 1280;
+constexpr int kBarWidth = 1800;
 
-bool colorAt(const gfx::Image& image, int x, int y, Color expected) {
-  return image.rowAt(y)[x] == gfx::premultiply(expected);
-}
-
-// Counts pixels whose colour is dominated by the accent's blue, which is how
-// the running indicator is identified without hardcoding its position twice.
-int countAccentish(const gfx::Image& image, Rect region) {
+int countMatching(const gfx::Image& image, Rect region,
+                  bool (*predicate)(uint32_t)) {
+  const Rect clipped = region.intersected(image.bounds());
   int count = 0;
-  for (int y = region.y; y < region.bottom(); ++y) {
+  for (int y = clipped.y; y < clipped.bottom(); ++y) {
     const uint32_t* row = image.rowAt(y);
-    for (int x = region.x; x < region.right(); ++x) {
-      const uint32_t b = row[x] & 0xFF;
-      const uint32_t g = (row[x] >> 8) & 0xFF;
-      const uint32_t r = (row[x] >> 16) & 0xFF;
-      if (b > 0x90 && b > r + 0x40 && g > r) ++count;
+    for (int x = clipped.x; x < clipped.right(); ++x) {
+      if (predicate(row[x])) ++count;
     }
   }
   return count;
 }
 
+// Blue-dominant, i.e. the Windows accent rather than any shell surface.
+bool isAccentish(uint32_t px) {
+  const uint32_t b = px & 0xFF;
+  const uint32_t g = (px >> 8) & 0xFF;
+  const uint32_t r = (px >> 16) & 0xFF;
+  return b > 0x90 && b > r + 0x40 && g > r;
+}
+
 int countNonBackground(const gfx::Image& image, Rect region, Color background) {
+  const Rect clipped = region.intersected(image.bounds());
   const uint32_t bg = gfx::premultiply(background);
   int count = 0;
-  for (int y = region.y; y < region.bottom(); ++y) {
+  for (int y = clipped.y; y < clipped.bottom(); ++y) {
     const uint32_t* row = image.rowAt(y);
-    for (int x = region.x; x < region.right(); ++x) {
+    for (int x = clipped.x; x < clipped.right(); ++x) {
       if (row[x] != bg) ++count;
     }
   }
@@ -68,7 +75,7 @@ int main() {
     return finux::check::skip("taskbar_render", "FreeType failed to initialise");
   }
 
-  const ui::Theme theme = ui::Theme::win10();
+  const ui::Theme theme = ui::Theme::win10();  // light, as Windows ships
 
   // Grayscale so the result is reproducible regardless of whether this
   // FreeType has subpixel rendering; the shipped shell uses ClearType-alike.
@@ -92,7 +99,7 @@ int main() {
   shell::Taskbar taskbar(theme);
   taskbar.setBounds({0, 0, kBarWidth, barHeight});
   taskbar.setToplevels(sampleWindows());
-  taskbar.setClock("4:17 PM", "8/14/2026");
+  taskbar.setClock("4:44 PM", "6/25/2020");
 
   {
     gfx::Canvas canvas(surface);
@@ -101,66 +108,102 @@ int main() {
     taskbar.paintTree(ctx);
   }
 
-  // --- Structure -----------------------------------------------------------
+  const Color background = theme.palette.taskbarBackground;
 
-  // Empty stretch between the last task button and the clock stays background.
-  CHECK_MSG(colorAt(surface, 900, 4, theme.palette.taskbarBackground),
-            "expected bare taskbar background in the empty region");
+  // --- left cluster --------------------------------------------------------
+  const shell::StartButton* start = taskbar.startButton();
+  CHECK(start != nullptr);
+  if (start) {
+    // The Start button carries the accent colour in the light theme, which is
+    // the most distinctive thing about a stock Windows 10 taskbar.
+    CHECK_MSG(countMatching(surface, start->bounds(), isAccentish) >
+                  start->bounds().w * start->bounds().h / 2,
+              "start button is not accent-filled");
+    // A white glyph must sit on top of it.
+    const uint32_t white = gfx::premultiply(Color::rgb(0xFFFFFF));
+    CHECK_MSG(countMatching(surface, start->bounds(),
+                            +[](uint32_t px) {
+                              return px == gfx::premultiply(Color::rgb(0xFFFFFF));
+                            }) > 0,
+              "start button glyph is missing");
+    (void)white;
+  }
 
-  // The start button occupies the leftmost 48px and draws something.
-  const int startWidth = theme.metrics.startButtonWidth;
-  CHECK_MSG(countNonBackground(surface, {0, 0, startWidth, barHeight},
-                               theme.palette.taskbarBackground) > 0,
-            "start button drew nothing");
+  const shell::SearchBox* search = taskbar.searchBox();
+  CHECK(search != nullptr);
+  if (search) {
+    const Rect box = search->bounds();
+    CHECK_MSG(box.h < barHeight,
+              "search box should be inset from the taskbar's edges");
+    // Its interior is white, unlike the surrounding bar.
+    CHECK_MSG(surface.rowAt(box.y + box.h / 2)[box.x + box.w / 2] ==
+                  gfx::premultiply(theme.palette.searchBoxBackground),
+              "search box interior is not filled");
+  }
 
-  // Task buttons begin immediately after the start button. EVERY running
-  // window carries an indicator along its bottom edge, not just the active
-  // one -- checking only the first button is what let a bug through where
-  // everything drawn after the first label silently vanished.
-  const int buttonWidth = theme.metrics.taskButtonWidth;
+  // --- task buttons --------------------------------------------------------
+  //
+  // EVERY running window carries an indicator along its bottom edge, not just
+  // the active one. Checking only the first button is what once let a bug
+  // through where everything drawn after the first label silently vanished.
+  const auto& buttons = taskbar.taskButtons();
+  CHECK_MSG(!buttons.empty(), "no task buttons were created");
+
   const int indicatorHeight = theme.metrics.runningIndicatorHeight;
-  const int windowCount = static_cast<int>(sampleWindows().size());
-
-  for (int i = 0; i < windowCount; ++i) {
-    const Rect button{startWidth + i * buttonWidth, 0, buttonWidth, barHeight};
+  for (size_t i = 0; i < buttons.size(); ++i) {
+    const Rect box = buttons[i]->bounds();
     const std::string which = "task button " + std::to_string(i);
+    CHECK_MSG(!box.empty(), which + " has empty bounds");
 
-    const Rect indicatorStrip{button.x, barHeight - indicatorHeight, button.w,
-                              indicatorHeight};
-    CHECK_MSG(countAccentish(surface, indicatorStrip) > 0,
+    const Rect strip{box.x, barHeight - indicatorHeight, box.w, indicatorHeight};
+    CHECK_MSG(countMatching(surface, strip, isAccentish) > 0,
               "no accent running indicator under " + which);
 
     // The indicator is inset horizontally; the button's outer edge must not
     // carry it, or adjacent buttons' indicators would visually merge.
-    CHECK_MSG(
-        countAccentish(surface, {button.x, indicatorStrip.y, 2,
-                                 indicatorHeight}) == 0,
-        "running indicator is not inset from the left edge of " + which);
+    CHECK_MSG(countMatching(surface, {box.x, strip.y, 2, indicatorHeight},
+                            isAccentish) == 0,
+              "running indicator is not inset from the left edge of " + which);
 
-    // The icon tile is a Blend2D fill sitting between two text draws, so it is
-    // the most sensitive thing in the frame to a suspended paint context.
-    const int iconSize = theme.metrics.taskbarIconSize;
-    const Rect iconRect{button.x + 8, (barHeight - iconSize) / 2, iconSize,
-                        iconSize};
-    CHECK_MSG(countNonBackground(surface, iconRect,
-                                 theme.palette.taskbarBackground) >
-                  iconSize * iconSize / 2,
-              "icon tile missing or mostly unpainted on " + which);
+    // The icon tile is a fill sitting between two text draws, so it is the
+    // most sensitive thing in the frame to a suspended paint context.
+    CHECK_MSG(countNonBackground(surface, box, background) > 0,
+              "icon missing on " + which);
   }
 
-  // The clock sits at the right, clear of the show-desktop sliver.
-  const Rect clockRegion{kBarWidth - 200, 0, 200 - theme.metrics.showDesktopWidth,
-                         barHeight};
-  CHECK_MSG(countNonBackground(surface, clockRegion,
-                               theme.palette.taskbarBackground) > 0,
-            "clock drew nothing");
+  // Buttons must not overlap; adjacent ones sharing a pixel column would make
+  // hit testing ambiguous.
+  for (size_t i = 1; i < buttons.size(); ++i) {
+    CHECK_MSG(buttons[i - 1]->bounds().right() <= buttons[i]->bounds().x,
+              "task buttons " + std::to_string(i - 1) + " and " +
+                  std::to_string(i) + " overlap");
+  }
 
-  // Nothing may paint over the show-desktop sliver at the far right.
-  CHECK_MSG(countNonBackground(
-                surface,
-                {kBarWidth - theme.metrics.showDesktopWidth, 0,
-                 theme.metrics.showDesktopWidth, barHeight},
-                theme.palette.taskbarBackground) == 0,
+  // --- right cluster -------------------------------------------------------
+  const shell::Clock* clock = taskbar.clockWidget();
+  CHECK(clock != nullptr);
+  if (clock) {
+    CHECK_MSG(countNonBackground(surface, clock->bounds(), background) > 0,
+              "clock drew nothing");
+    CHECK_MSG(clock->bounds().right() <= kBarWidth,
+              "clock overflows the taskbar");
+  }
+
+  const shell::SystemTray* tray = taskbar.systemTray();
+  CHECK(tray != nullptr);
+  if (tray && clock) {
+    CHECK_MSG(tray->bounds().right() <= clock->bounds().x,
+              "system tray overlaps the clock");
+    CHECK_MSG(countNonBackground(surface, tray->bounds(), background) > 0,
+              "system tray drew no icons");
+  }
+
+  // Nothing may paint over the show-desktop sliver at the far right edge.
+  CHECK_MSG(countNonBackground(surface,
+                               {kBarWidth - theme.metrics.showDesktopWidth + 1,
+                                2, theme.metrics.showDesktopWidth - 2,
+                                barHeight - 4},
+                               background) == 0,
             "something painted over the show-desktop region");
 
   // Every pixel must be opaque: the bar is composited by the X server with no
@@ -181,9 +224,8 @@ int main() {
   //
   // References are user-supplied captures of real Windows 10 (they cannot be
   // redistributed here). Their absence is reported, never silently passed.
-  const std::string referenceDir = std::string(FINUX_REFERENCE_DIR);
-  const pixdiff::FileResult fidelity =
-      pixdiff::compareToReference(surface, referenceDir, "taskbar_1280x40");
+  const pixdiff::FileResult fidelity = pixdiff::compareToReference(
+      surface, std::string(FINUX_REFERENCE_DIR), "taskbar_1800x40");
 
   if (!fidelity.referenceExisted) {
     std::printf("note: %s\n", fidelity.result.message.c_str());

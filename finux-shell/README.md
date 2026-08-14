@@ -4,10 +4,21 @@ A natively written C++ replica of the Windows 10 shell for Linux — the taskbar
 first, `explorer.exe`'s file-manager window after that — rendered pixel by
 pixel rather than themed.
 
-**Status: stages 1–2 of 7.** The rendering foundation, the widget core, the
-Windows-tuned text stack, the X11 backend and the fidelity harness exist and
-are tested. The bar draws, docks, reserves screen space and lists real windows.
-The Start menu, context menus, system tray and Explorer window do not exist yet.
+**Status: stages 1–3 of 7.** The rendering foundation, widget core,
+Windows-tuned text stack, X11 backend and fidelity harness are in place and
+tested. The taskbar draws, docks, reserves screen space and lists real windows,
+with search box, Cortana, Task View, pinned apps, notification area and clock.
+The Start menu renders its full three-column layout — icon rail, alphabetical
+app list, and a tile grid with groups, folder tiles and all four tile sizes.
+
+Not yet built: context menus, the Start menu flyout wiring (it renders, but
+clicking Start does not open it yet), real application icons, live window
+thumbnails, and the Explorer window.
+
+    ./build/tools/finux-render-desktop desktop.png 1800 900 light
+
+renders the whole shell to a PNG, offscreen and deterministically — the
+artefact to hold next to a Windows 10 screenshot.
 
 ## Why not just theme GTK or Qt
 
@@ -63,6 +74,7 @@ cd build && ctest --output-on-failure
 | `test_canvas_interleave` | Drawing interleaved with direct pixel access |
 | `test_text` | Shaping, rasterisation, clipping, UTF-8-safe ellipsis |
 | `test_taskbar_render` | Offscreen taskbar layout and structure |
+| `test_startmenu_render` | Start menu columns and tile-grid arithmetic |
 | `x11_smoke` | Real WM: strut reservation, placement, on-screen pixels |
 
 Tests that cannot run (no fonts, no X server, no `openbox`) report as
@@ -106,8 +118,8 @@ binary assets is not. See `docs/ASSETS.md`.
 
 1. ✅ X11 backend, strut-reserving bar, Blend2D surface
 2. ✅ Widget/layout core, Windows-tuned text stack, pixel-diff harness
-3. ⬜ Task buttons from real icons, grouping, hover thumbnails (XComposite), tray
-4. ⬜ Context menus and the Start menu
+3. ✅ Light theme, full taskbar chrome, notification area, Start menu layout
+4. ⬜ Start flyout wiring, context menus, real icons, hover thumbnails
 5. ⬜ `finux-explorer`: nav pane, breadcrumb address bar, Details/Icons views
 6. ⬜ File operations, ribbon, Trash, thumbnails
 7. ⬜ Wayland backend (wlr-layer-shell + foreign-toplevel + screencopy)
