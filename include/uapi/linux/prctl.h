@@ -438,4 +438,21 @@ struct prctl_mm_map {
 #define PR_SET_NT_DRIVE		84
 #define PR_GET_NT_DRIVE		85
 
+/*
+ * Get or set the calling process's NT system-call mode.  When on, the
+ * process's `syscall` instruction is dispatched through the NT service
+ * table using the Windows x64 ABI (RAX = NT service number; arguments in
+ * R10, RDX, R8, R9 then the stack) instead of the Linux syscall table.
+ *
+ * PR_SET_NT_SYSCALL_MODE takes 1 in arg2 to enter the mode and 0 to leave
+ * it; the mode is sticky, so a process normally sets it once and never
+ * makes a Linux system call again.  PR_GET_NT_SYSCALL_MODE writes the
+ * current state (0 or 1) through the pointer in arg2 - only useful before
+ * the mode is entered, since afterwards prctl() itself dispatches as NT.
+ *
+ * Both fail with -EINVAL when CONFIG_NT_FS_PERSONALITY is not enabled.
+ */
+#define PR_SET_NT_SYSCALL_MODE	86
+#define PR_GET_NT_SYSCALL_MODE	87
+
 #endif /* _LINUX_PRCTL_H */

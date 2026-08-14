@@ -1064,6 +1064,17 @@ struct task_struct {
 #ifdef CONFIG_PREEMPT_RT
 	struct netdev_xmit		net_xmit;
 #endif
+#ifdef CONFIG_NT_FS_PERSONALITY
+	/*
+	 * NT system-call dispatch mode.  When non-zero this task's `syscall`
+	 * instruction is dispatched through the NT service table using the
+	 * Windows x64 ABI instead of the Linux syscall table.  Sticky; set by
+	 * prctl(PR_SET_NT_SYSCALL_MODE) or the PE loader.  See
+	 * <linux/nt_syscall.h>.  A plain word rather than a bitfield so the
+	 * sticky store never read-modify-writes a word another CPU updates.
+	 */
+	unsigned int			nt_syscall_mode;
+#endif
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
 	struct restart_block		restart_block;

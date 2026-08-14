@@ -44,6 +44,7 @@
 #include <linux/version.h>
 #include <linux/ctype.h>
 #include <linux/nt_personality.h>
+#include <linux/nt_syscall.h>
 #include <linux/syscall_user_dispatch.h>
 
 #include <linux/compat.h>
@@ -2940,6 +2941,21 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 				 (unsigned int __user *)arg2);
 		break;
 	}
+	case PR_SET_NT_SYSCALL_MODE:
+		if (arg2 > 1 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		if (arg2)
+			nt_syscall_mode_set(me);
+		else
+			nt_syscall_mode_clear(me);
+		error = 0;
+		break;
+	case PR_GET_NT_SYSCALL_MODE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = put_user((unsigned int)nt_syscall_mode(me),
+				 (unsigned int __user *)arg2);
+		break;
 #endif
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);

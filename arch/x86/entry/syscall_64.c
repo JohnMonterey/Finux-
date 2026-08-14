@@ -7,6 +7,7 @@
 #include <linux/syscalls.h>
 #include <linux/entry-common.h>
 #include <linux/nospec.h>
+#include <linux/nt_syscall.h>
 #include <asm/syscall.h>
 
 #define __SYSCALL(nr, sym) extern long __x64_##sym(const struct pt_regs *);
@@ -83,9 +84,49 @@ static __always_inline bool do_syscall_x32(struct pt_regs *regs, int nr)
 	return false;
 }
 
+#ifdef CONFIG_NT_SYSCALL
+/*
+ * Dispatch a `syscall` from an NT-personality task.  RAX holds an NT service
+ * number, not a Linux one, and the arguments follow the Win64 ABI, so neither
+ * the Linux syscall tables nor the SYSCALL_WORK entry work (seccomp, audit,
+ * syscall ptrace and tracepoints, all keyed off the Linux syscall number) may
+ * run.  We still bracket the call with the same kernel entry/exit bookkeeping
+ * as the Linux path - enter_from_user_mode() up front and the normal
+ * syscall_exit_to_user_mode() on the way out - but branch straight to the NT
+ * dispatcher in between, skipping syscall_enter_from_user_mode_work().
+ *
+ * SECURITY: because that entry work is skipped, NT-mode syscalls are neither
+ * filtered by Linux seccomp nor recorded by Linux audit.  See
+ * fs/ntpers/dispatch.c.
+ */
+static __always_inline bool do_nt_syscall_64(struct pt_regs *regs)
+{
+	enter_from_user_mode(regs);
+
+	instrumentation_begin();
+	local_irq_enable();
+	add_random_kstack_offset();
+	nt_do_syscall(regs);
+	instrumentation_end();
+
+	syscall_exit_to_user_mode(regs);
+
+	/*
+	 * The NT stub does not leave RCX == RIP / R11 == EFLAGS, so the SYSRET
+	 * fast-path invariants do not hold; return via the IRET exit path.
+	 */
+	return false;
+}
+#endif /* CONFIG_NT_SYSCALL */
+
 /* Returns true to return using SYSRET, or false to use IRET */
 __visible noinstr bool do_syscall_64(struct pt_regs *regs, int nr)
 {
+#ifdef CONFIG_NT_SYSCALL
+	if (unlikely(nt_syscall_mode(current)))
+		return do_nt_syscall_64(regs);
+#endif
+
 	nr = syscall_enter_from_user_mode(regs, nr);
 
 	instrumentation_begin();

@@ -499,6 +499,41 @@ struct nt_file_standard_information {
 
 /*
  * ---------------------------------------------------------------------
+ * NT system-service numbers  (layer: NT kernel - the SSDT)
+ * ---------------------------------------------------------------------
+ *
+ * The value a native ntdll stub loads into EAX before `syscall` to select
+ * a system service.  Real Windows numbers them per build (and shuffles them
+ * between releases on purpose); these are Finux's own assignment - a small
+ * contiguous set from zero, one per service the personality implements - so
+ * they are stable and legible rather than matching any particular Windows
+ * SSDT.  A later stage that wants binary compatibility with a specific
+ * ntdll can add a per-build remap in front of this table without disturbing
+ * the dispatcher, which only ever sees these numbers.
+ *
+ * They live in the UAPI header because both the in-kernel dispatch table
+ * (fs/ntpers/dispatch.c) and any userspace that drives the raw `syscall`
+ * convention (the selftest, a future ntdll shim) must agree on them.
+ */
+#define NT_SYS_NtClose			0
+#define NT_SYS_NtCreateFile		1
+#define NT_SYS_NtOpenFile		2
+#define NT_SYS_NtReadFile		3
+#define NT_SYS_NtWriteFile		4
+#define NT_SYS_NtQueryInformationFile	5
+#define NT_SYS_NtTerminateProcess	6
+#define NT_SYS_MAX			7	/* one past the last valid number */
+
+/*
+ * NtTerminateProcess process handle.  A real caller passes the current
+ * process pseudo-handle GetCurrentProcess() == (HANDLE)-1; the null handle
+ * (0) is also accepted as naming the caller.  Any other value is a handle
+ * to another process, which this scaffold does not implement.
+ */
+#define NT_CURRENT_PROCESS		0xffffffffffffffffULL
+
+/*
+ * ---------------------------------------------------------------------
  * prctl() personality control
  * ---------------------------------------------------------------------
  * See include/uapi/linux/prctl.h for the PR_* numbers.

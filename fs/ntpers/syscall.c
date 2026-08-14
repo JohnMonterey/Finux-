@@ -30,6 +30,7 @@
 #include <linux/minmax.h>
 #include <linux/mm.h>
 #include <linux/nls.h>
+#include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/stddef.h>
@@ -885,5 +886,38 @@ u32 NtQueryInformationFile(u64 file_handle,
 		return STATUS_ACCESS_VIOLATION;
 	if (nt_put_io_status(io_status_block, STATUS_SUCCESS, out_len))
 		return STATUS_ACCESS_VIOLATION;
+	return STATUS_SUCCESS;
+}
+
+/**
+ * NtTerminateProcess - terminate a process (NT system service)
+ * @process_handle: the process to terminate
+ * @exit_status:    NTSTATUS to report as the exit code
+ *
+ * The minimal NtTerminateProcess an NT-mode process needs to exit without
+ * ever making a Linux system call.  Only self-termination is implemented:
+ * @process_handle must be the current-process pseudo-handle (HANDLE)-1 or
+ * the null handle (0), both of which name the caller.  A handle to any other
+ * process returns STATUS_NOT_IMPLEMENTED - honest about what this scaffold
+ * does rather than silently ignoring the target.
+ *
+ * Self-termination ends the whole thread group through the kernel's
+ * group-exit path, exactly as the exit_group() system call does, and does
+ * not return.  Only the low eight bits of @exit_status survive into the
+ * Linux wait status, the same truncation every Linux process exit undergoes;
+ * preserving the full 32-bit NTSTATUS a Win32 GetExitCodeProcess would see
+ * is future work.
+ *
+ * Returns STATUS_NOT_IMPLEMENTED for a non-self handle; does not return on
+ * self-termination.
+ */
+u32 NtTerminateProcess(u64 process_handle, u32 exit_status)
+{
+	if (process_handle != 0 && process_handle != NT_CURRENT_PROCESS)
+		return STATUS_NOT_IMPLEMENTED;
+
+	do_group_exit((exit_status & 0xff) << 8);
+
+	/* do_group_exit() does not return; keep the compiler content. */
 	return STATUS_SUCCESS;
 }

@@ -613,6 +613,7 @@ u32 NtQueryInformationFile(u64 file_handle,
 			   struct nt_io_status_block __user *io_status_block,
 			   void __user *file_information, u32 length,
 			   u32 info_class);
+u32 NtTerminateProcess(u64 process_handle, u32 exit_status);
 
 /* --- share / delete semantics (fs/ntpers/share.c) -------------------- */
 
