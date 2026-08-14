@@ -125,6 +125,14 @@ static atomic_long_t nt_ci_hits = ATOMIC_LONG_INIT(0);
 static atomic_long_t nt_ci_misses = ATOMIC_LONG_INIT(0);
 static atomic_long_t nt_ci_scans = ATOMIC_LONG_INIT(0);
 static atomic_long_t nt_ci_stale = ATOMIC_LONG_INIT(0);
+/*
+ * Fast-path misses that had to be re-walked because the volume's
+ * casefolding hint turned out not to apply to every directory on the
+ * path.  A number that keeps climbing on a volume meant to be uniformly
+ * casefolded means part of the tree is missing its +F flag, and every
+ * miss in it is costing a directory read.
+ */
+static atomic_long_t nt_ci_retries = ATOMIC_LONG_INIT(0);
 
 /* The Unicode map used for folding when the superblock has none. */
 static struct unicode_map *nt_ci_encoding;
@@ -562,6 +570,26 @@ int nt_ci_lookup(const struct path *dir, const char *name, size_t len,
 EXPORT_SYMBOL_GPL(nt_ci_lookup);
 
 /**
+ * nt_ci_count_retry - note a fast-path miss that needed the folding walk
+ */
+void nt_ci_count_retry(void)
+{
+	atomic_long_inc(&nt_ci_retries);
+}
+
+/**
+ * nt_ci_retry_count - how many such retries have happened
+ *
+ * Exposed so the tests can assert that the guard in nt_path_resolve()
+ * actually suppresses the retry, rather than only that the answer is
+ * right either way.
+ */
+long nt_ci_retry_count(void)
+{
+	return atomic_long_read(&nt_ci_retries);
+}
+
+/**
  * nt_ci_cache_stats - render fold-hint cache counters for debugfs
  * @m: the seq_file
  */
@@ -572,6 +600,7 @@ void nt_ci_cache_stats(struct seq_file *m)
 	seq_printf(m, "misses %ld\n", atomic_long_read(&nt_ci_misses));
 	seq_printf(m, "scans %ld\n", atomic_long_read(&nt_ci_scans));
 	seq_printf(m, "stale %ld\n", atomic_long_read(&nt_ci_stale));
+	seq_printf(m, "retries %ld\n", atomic_long_read(&nt_ci_retries));
 	seq_printf(m, "buckets %lu\n", NT_CI_BUCKETS);
 	seq_printf(m, "max_entries %u\n", NT_CI_MAX_ENTRIES);
 }

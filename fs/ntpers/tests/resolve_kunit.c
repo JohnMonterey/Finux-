@@ -26,6 +26,7 @@
 #include <linux/nt_personality.h>
 
 #include "ntpers_kunit.h"
+#include "../internal.h"
 
 struct nt_rs_ctx {
 	struct nt_test_fs	fs;
@@ -300,12 +301,96 @@ static void nt_rs_mixed_casefold(struct kunit *test)
 	ctx->vol->flags &= ~NT_VOL_NATIVE_CI;
 }
 
+/*
+ * The retry is not paid on every miss.
+ *
+ * Correctness alone would be satisfied by re-walking each time the fast
+ * path returns -ENOENT, and that would be expensive in the worst place:
+ * a PE loader resolving an import misses most of the DLL search order,
+ * and a folding walk reads a directory per component.  The guard trusts
+ * the miss when the final component's parent resolves and folds.
+ *
+ * tmpfs never folds, so every miss here is genuinely unresolvable by the
+ * fast path and every one must retry - which is what makes the *other*
+ * direction testable: a miss whose parent does not even exist has
+ * nothing above it that could fold, and must not be retried either.
+ */
+static void nt_rs_retry_is_bounded(struct kunit *test)
+{
+	struct nt_rs_ctx *ctx = CTX(test);
+	struct dentry *dir;
+	struct nt_path out;
+	long before;
+
+	dir = nt_test_create(test, &ctx->fs, ctx->fs.root.dentry, "Windows",
+			     true);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(dir));
+
+	ctx->vol->flags |= NT_VOL_NATIVE_CI;
+
+	/*
+	 * A missing name in a directory that exists: the parent resolves
+	 * but does not fold, so this one has to be re-walked.
+	 */
+	before = nt_ci_retry_count();
+	KUNIT_EXPECT_EQ(test,
+			nt_rs_resolve(test, "C:\\Windows\\Nothing.dll",
+				      NT_RESOLVE_CASE_INSENSITIVE, &out),
+			-ENOENT);
+	KUNIT_EXPECT_GT_MSG(test, nt_ci_retry_count(), before,
+			    "a non-folding parent must be re-walked");
+
+	/*
+	 * A missing name in a directory that does not exist either.  The
+	 * parent lookup fails, so there is no folding directory to trust
+	 * and the walk still has to run - it is the only thing that can
+	 * tell "absent" from "spelled differently" for the parent itself.
+	 */
+	before = nt_ci_retry_count();
+	KUNIT_EXPECT_EQ(test,
+			nt_rs_resolve(test, "C:\\NoSuchDir\\Nothing.dll",
+				      NT_RESOLVE_CASE_INSENSITIVE, &out),
+			-ENOENT);
+	KUNIT_EXPECT_GT(test, nt_ci_retry_count(), before);
+
+	/*
+	 * A case-sensitive caller never took the folding path to begin
+	 * with, so it must never trigger a retry however badly the volume
+	 * flag is set.
+	 */
+	before = nt_ci_retry_count();
+	KUNIT_EXPECT_EQ(test,
+			nt_rs_resolve(test, "C:\\Windows\\Nothing.dll", 0,
+				      &out),
+			-ENOENT);
+	KUNIT_EXPECT_EQ_MSG(test, nt_ci_retry_count(), before,
+			    "a case-sensitive miss must not be re-walked");
+
+	/*
+	 * Nor should an error that is not -ENOENT.  A file where a
+	 * directory was demanded is absent in no sense at all.
+	 */
+	KUNIT_ASSERT_FALSE(test, IS_ERR(nt_test_create(test, &ctx->fs, dir,
+						       "win.ini", false)));
+	before = nt_ci_retry_count();
+	KUNIT_EXPECT_EQ(test,
+			nt_rs_resolve(test, "C:\\Windows\\win.ini",
+				      NT_RESOLVE_CASE_INSENSITIVE |
+				      NT_RESOLVE_DIRECTORY, &out),
+			-ENOTDIR);
+	KUNIT_EXPECT_EQ_MSG(test, nt_ci_retry_count(), before,
+			    "-ENOTDIR is not a case-folding miss");
+
+	ctx->vol->flags &= ~NT_VOL_NATIVE_CI;
+}
+
 static struct kunit_case nt_resolve_test_cases[] = {
 	KUNIT_CASE(nt_rs_final_symlink),
 	KUNIT_CASE(nt_rs_symlink_to_dir),
 	KUNIT_CASE(nt_rs_dangling_symlink),
 	KUNIT_CASE(nt_rs_intermediate_symlink),
 	KUNIT_CASE(nt_rs_mixed_casefold),
+	KUNIT_CASE(nt_rs_retry_is_bounded),
 	{}
 };
 

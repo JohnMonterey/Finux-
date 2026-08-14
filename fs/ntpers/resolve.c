@@ -184,6 +184,71 @@ static int nt_resolve_start(struct nt_task_ctx *ctx,
  * volume with casefolding enabled, nt_path_resolve() never calls this and
  * gets the full VFS walk.
  */
+/*
+ * Was a fast-path -ENOENT the final answer, or does it need the folding
+ * walk to confirm it?
+ *
+ * The fast path runs when the volume is believed to fold case, and that
+ * belief comes from the volume root alone.  When it misses, either the
+ * name really is absent or some directory along the path does not fold
+ * and the ordinary VFS walk compared case-sensitively inside it.
+ *
+ * Retrying every miss would be correct and expensive in exactly the wrong
+ * place.  A PE loader resolving an import walks the DLL search order -
+ * application directory, System32, System, Windows, then PATH - and
+ * misses almost all of it.  Paying a full folding walk, with a directory
+ * read per component, on each of those misses would make the common case
+ * pay for the rare one.
+ *
+ * The parent of the final component decides it.  If the parent resolves
+ * and folds, no case-insensitive match could have been missed in it, and
+ * the -ENOENT stands.  If the parent itself did not resolve, some
+ * directory above it did not fold either, and the whole path needs the
+ * slow walk.  So checking the parent is both necessary and sufficient,
+ * and it costs one lookup that the dcache has almost certainly cached
+ * already, because a search order probes the same few directories over
+ * and over.
+ */
+static bool nt_ci_miss_is_final(const struct path *start, const char *rel,
+				unsigned int rel_len)
+{
+	const char *slash = NULL;
+	struct path parent;
+	unsigned int i;
+	char *pbuf;
+	bool folds;
+
+	for (i = rel_len; i > 0; i--) {
+		if (rel[i - 1] == '/') {
+			slash = rel + i - 1;
+			break;
+		}
+	}
+
+	/*
+	 * No separator: the parent is @start, and the fast path only ran
+	 * because @start folds or the volume claims to.  Distinguish those
+	 * - the volume's claim is the thing that can be wrong.
+	 */
+	if (!slash)
+		return nt_dir_is_native_ci(start->dentry);
+
+	pbuf = kmemdup_nul(rel, slash - rel, GFP_KERNEL);
+	if (!pbuf)
+		return false;	/* cannot tell; retrying is the safe answer */
+
+	if (vfs_path_lookup(start->dentry, start->mnt, pbuf,
+			    LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &parent)) {
+		kfree(pbuf);
+		return false;
+	}
+	kfree(pbuf);
+
+	folds = nt_dir_is_native_ci(parent.dentry);
+	path_put(&parent);
+	return folds;
+}
+
 static int nt_walk_ci(const struct path *start, const char *rel,
 		      unsigned int rel_len, u32 flags, struct path *out)
 {
@@ -418,12 +483,18 @@ int nt_path_resolve(struct nt_task_ctx *ctx, const struct nt_path_parse *p,
 		 * So a fast-path -ENOENT is not proof the name is absent -
 		 * it may only mean some directory along the way does not
 		 * fold.  Retry with the folding walk below before telling a
-		 * Windows caller the file does not exist.  Any other error
-		 * is real, and a case-sensitive caller has nothing to
-		 * retry.
+		 * Windows caller the file does not exist, but only when the
+		 * miss could actually have been caused by that; see
+		 * nt_ci_miss_is_final().  Any other error is real, and a
+		 * case-sensitive caller has nothing to retry.
 		 */
 		if (!want_ci || err != -ENOENT)
 			goto out_put;
+
+		if (nt_ci_miss_is_final(&start, rel, rel_len))
+			goto out_put;
+
+		nt_ci_count_retry();
 	}
 
 	err = nt_walk_ci(&start, rel, rel_len, flags, &result);

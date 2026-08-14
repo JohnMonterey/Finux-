@@ -33,6 +33,8 @@ void nt_namespace_exit(void);
 
 int nt_casefold_init(void);
 void nt_casefold_exit(void);
+void nt_ci_count_retry(void);
+long nt_ci_retry_count(void);
 
 /* --- debugfs.c ------------------------------------------------------- */
 
