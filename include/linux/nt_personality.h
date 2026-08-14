@@ -30,6 +30,7 @@
 #include <linux/rcupdate.h>
 #include <linux/spinlock.h>
 #include <linux/uuid.h>
+#include <linux/xarray.h>
 #include <uapi/linux/nt_personality.h>
 
 struct dentry;
@@ -167,6 +168,26 @@ struct nt_drive_cwd {
 };
 
 /**
+ * struct nt_handle_table - a process's NT handle namespace
+ * @xa:	map from handle index to the struct nt_open it names
+ *
+ * The NT Object Manager reaches every open object through a handle: an
+ * opaque integer, private to the process, that indexes this table.  Handle
+ * *values* are the index times four - the low two bits are Win32 tag bits
+ * and are always clear in a value the kernel hands out - so index 1 is
+ * handle 4, index 2 is handle 8, and so on; index 0 is held reserved so
+ * that handle 0 is always the null handle.
+ *
+ * An xarray is the right structure: a sparse, id-keyed map with its own
+ * allocating id assignment (XA_FLAGS_ALLOC1), RCU lookups and internal
+ * locking - exactly an NT handle table's shape - so the table needs no lock
+ * of its own.  See fs/ntpers/handle.c.
+ */
+struct nt_handle_table {
+	struct xarray		xa;
+};
+
+/**
  * struct nt_task_ctx - per-process NT personality state
  * @count:	reference count; shared through CLONE_FS
  * @ns:		namespace this process resolves against; holds a reference
@@ -176,11 +197,16 @@ struct nt_drive_cwd {
  * @nr_cwd:	valid entries in @cwd
  * @max_cwd:	allocated entries in @cwd
  * @cwd:	lazily grown per-drive current directory cache
+ * @handles:	the process's NT handle table; self-locked, see
+ *		struct nt_handle_table
  *
  * Hangs off struct fs_struct, so it follows the same sharing rules as the
  * root and current directory: threads of a process share it, and CLONE_FS
  * shares it across processes.  That matches Windows, where the current
- * directory is process-wide.
+ * directory is process-wide - and it makes @handles a per-process handle
+ * table shared by every thread, which is exactly the NT handle model.  A
+ * fork gets its own fresh context, so it starts with an empty table:
+ * handles are not inherited across a plain fork, only shared among threads.
  */
 struct nt_task_ctx {
 	refcount_t		count;
@@ -193,6 +219,8 @@ struct nt_task_ctx {
 	u8			nr_cwd;
 	u8			max_cwd;
 	struct nt_drive_cwd	*cwd;
+
+	struct nt_handle_table	handles;
 };
 
 /**
@@ -509,6 +537,16 @@ struct nt_open_result {
 int nt_create(struct nt_task_ctx *ctx, const char *name,
 	      const struct nt_create_req *req, struct nt_open_result *out);
 void nt_close(struct nt_open *handle);
+
+/* --- NT handle table (fs/ntpers/handle.c) ---------------------------- */
+
+void nt_handle_table_init(struct nt_handle_table *ht);
+void nt_handle_table_destroy(struct nt_handle_table *ht);
+u32 nt_handle_alloc(struct nt_handle_table *ht, struct nt_open *open,
+		    u32 *handle);
+u32 nt_handle_lookup(struct nt_handle_table *ht, u32 handle,
+		     struct nt_open **open);
+u32 nt_handle_close(struct nt_handle_table *ht, u32 handle);
 
 /* --- share / delete semantics (fs/ntpers/share.c) -------------------- */
 

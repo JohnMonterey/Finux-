@@ -291,6 +291,57 @@ enum nt_path_type {
 
 /*
  * ---------------------------------------------------------------------
+ * NT Object Manager - handles and status codes  (layer: NT kernel)
+ * ---------------------------------------------------------------------
+ *
+ * Every object an NT process holds open - a file or directory today, an
+ * event or a section later - is named by a handle: an opaque integer,
+ * private to the process, that indexes the process's handle table.  The
+ * full NtCreateFile ABI (OBJECT_ATTRIBUTES, IO_STATUS_BLOCK) is not here
+ * yet; this is only what the handle table itself needs.
+ *
+ * Representation.  On the kernel/userspace boundary a handle is an opaque
+ * __u32.  The NT kernel guarantees a handle's significant content fits in
+ * 32 bits even on 64-bit Windows, and it hands out values that are
+ * multiples of four, leaving the low two bits for the tag bits Win32 keeps
+ * in them.  It is therefore carried as a plain __u32 rather than a typedef
+ * - matching how the kernel represents other opaque handles in its UAPI,
+ * e.g. DRM and io_uring - which also keeps the arithmetic explicit: a
+ * handle is its table index times four.
+ *
+ * Zero is the null handle: it names no object and is never allocated, so a
+ * zeroed field holds no accidental handle.  The top of the range - where a
+ * value read as signed is negative - is left for the pseudo-handles Windows
+ * adds on top (GetCurrentProcess() is (HANDLE)-1, GetCurrentThread() is
+ * (HANDLE)-2, ...); the object-handle allocator caps its indices far below
+ * that range and never collides with it.
+ */
+#define NT_NULL_HANDLE			0
+
+/*
+ * NTSTATUS is the NT kernel's result type: a 32-bit code whose high bits
+ * are a severity (0x0 success, 0xC error).  Windows types it as a signed
+ * LONG, but every code here is used only by exact-value comparison, so it
+ * is carried as a __u32 to keep the 0xC000xxxx error constants clear of
+ * implementation-defined sign conversions.  Only the codes the handle
+ * table returns are defined; the rest of the space arrives with the
+ * operations that need it.
+ */
+#define STATUS_SUCCESS			0x00000000
+#define STATUS_INVALID_HANDLE		0xC0000008
+#define STATUS_INVALID_PARAMETER	0xC000000D
+#define STATUS_NO_MEMORY		0xC0000017
+#define STATUS_TOO_MANY_OPENED_FILES	0xC000011F
+/*
+ * Reserved: the close path will return this once a handle can be marked
+ * protected from closing (OBJ_PROTECT_CLOSE) and once pseudo-handles exist.
+ * Defined now so the numeric ABI is fixed ahead of the code - as the NT_FS_*
+ * capability bits above already are - but no path returns it yet.
+ */
+#define STATUS_HANDLE_NOT_CLOSABLE	0xC0000235
+
+/*
+ * ---------------------------------------------------------------------
  * prctl() personality control
  * ---------------------------------------------------------------------
  * See include/uapi/linux/prctl.h for the PR_* numbers.

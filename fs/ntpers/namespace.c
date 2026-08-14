@@ -135,6 +135,7 @@ struct nt_task_ctx *nt_ctx_alloc(struct nt_namespace *ns)
 
 	refcount_set(&ctx->count, 1);
 	spin_lock_init(&ctx->lock);
+	nt_handle_table_init(&ctx->handles);
 	ctx->ns = nt_ns_get(ns ? ns : &init_nt_ns);
 	ctx->cur_drive = 'C';
 
@@ -164,6 +165,13 @@ void nt_ctx_put(struct nt_task_ctx *ctx)
 
 	if (!ctx || !refcount_dec_and_test(&ctx->count))
 		return;
+
+	/*
+	 * Last reference to this process's NT state.  Close every handle still
+	 * open first, so process exit releases the nt_open objects - and the
+	 * mount and dentry references behind them - rather than leaking them.
+	 */
+	nt_handle_table_destroy(&ctx->handles);
 
 	for (i = 0; i < ctx->nr_cwd; i++) {
 		if (ctx->cwd[i].path.dentry)
@@ -445,6 +453,12 @@ int nt_fs_struct_copy(struct fs_struct *new_fs, struct fs_struct *old_fs)
 	if (!new)
 		return -ENOMEM;
 
+	/*
+	 * Personality flags, current drive and the per-drive cwd cache carry
+	 * over.  The handle table deliberately does not: a plain fork starts
+	 * with an empty one, and only threads (which share this fs_struct)
+	 * share handles, exactly as NT inherits handles only when asked to.
+	 */
 	new->flags = READ_ONCE(old->flags);
 	new->cur_drive = READ_ONCE(old->cur_drive);
 
