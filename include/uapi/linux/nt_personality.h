@@ -151,6 +151,36 @@ enum nt_path_type {
 #define NT_PARSE_TRIMMED	(1U << 6)
 
 /*
+ * Volume capability flags, as GetVolumeInformation() reports them in
+ * lpFileSystemFlags.  Values are the Win32 FILE_* constants.
+ *
+ * These exist so that the filesystem *name* and the filesystem
+ * *capabilities* can be answered separately, and honestly.  Reporting
+ * "NTFS" is a compatibility decision - there is no Win32 vocabulary for
+ * ext4, and Samba has answered this way for decades - but a caller that
+ * asks whether the volume supports named streams or persistent ACLs is
+ * asking a question with a real answer, and it must get the real one.
+ * An application told it has reparse points will use them.
+ */
+#define NT_FS_CASE_SENSITIVE_SEARCH	0x00000001
+#define NT_FS_CASE_PRESERVED_NAMES	0x00000002
+#define NT_FS_UNICODE_ON_DISK		0x00000004
+#define NT_FS_PERSISTENT_ACLS		0x00000008
+#define NT_FS_FILE_COMPRESSION		0x00000010
+#define NT_FS_VOLUME_QUOTAS		0x00000020
+#define NT_FS_SUPPORTS_SPARSE_FILES	0x00000040
+#define NT_FS_SUPPORTS_REPARSE_POINTS	0x00000080
+#define NT_FS_SUPPORTS_OBJECT_IDS	0x00010000
+#define NT_FS_SUPPORTS_ENCRYPTION	0x00020000
+#define NT_FS_NAMED_STREAMS		0x00040000
+#define NT_FS_READ_ONLY_VOLUME		0x00080000
+#define NT_FS_SUPPORTS_TRANSACTIONS	0x00200000
+#define NT_FS_SUPPORTS_HARD_LINKS	0x00400000
+#define NT_FS_SUPPORTS_EXTENDED_ATTRIBUTES 0x00800000
+#define NT_FS_SUPPORTS_OPEN_BY_FILE_ID	0x01000000
+#define NT_FS_SUPPORTS_USN_JOURNAL	0x02000000
+
+/*
  * Input flags for the parser.
  */
 /* Treat the input as already verbatim (as if it had a \\?\ prefix). */

@@ -123,6 +123,65 @@ static void nt_volume_set_fs_name(struct nt_volume *vol,
 		strscpy(vol->fs_name, "FAT32", sizeof(vol->fs_name));
 }
 
+/*
+ * Report what the volume can actually do.
+ *
+ * nt_volume_set_fs_name() answers "what is this filesystem called" with a
+ * compatibility answer.  This answers "what does it support" with a true
+ * one, and the two must not be conflated: an application that is told the
+ * volume is NTFS may go looking for named streams and reparse points, and
+ * the only thing stopping it is this flags word.  So a capability is set
+ * here when the NT personality implements it *and* the backing filesystem
+ * can carry it - not when the name suggests it ought to exist.
+ *
+ * Several bits are deliberately absent and will stay absent until the
+ * feature behind them is real:
+ *
+ *   NT_FS_PERSISTENT_ACLS		security descriptors are stored but
+ *					advisory; they do not govern access
+ *   NT_FS_SUPPORTS_REPARSE_POINTS	Stage 4
+ *   NT_FS_NAMED_STREAMS		Stage 4
+ *   NT_FS_SUPPORTS_OPEN_BY_FILE_ID	file IDs are reported, but nothing
+ *					can open by one yet
+ *   OBJECT_IDS, ENCRYPTION, QUOTAS,
+ *   TRANSACTIONS, USN_JOURNAL		not planned
+ */
+static void nt_volume_set_fs_flags(struct nt_volume *vol,
+				   const struct super_block *sb,
+				   const struct dentry *root)
+{
+	bool is_vfat = sb->s_type && sb->s_type->name &&
+		       !strcmp(sb->s_type->name, "vfat");
+	u32 flags = NT_FS_CASE_PRESERVED_NAMES | NT_FS_UNICODE_ON_DISK;
+
+	/*
+	 * Whether a caller can distinguish two names differing only in
+	 * case.  True exactly when the backing directory does not fold,
+	 * which is the same condition the resolver keys off.
+	 */
+	if (!nt_dir_is_native_ci(root))
+		flags |= NT_FS_CASE_SENSITIVE_SEARCH;
+
+	if (!is_vfat) {
+		flags |= NT_FS_SUPPORTS_SPARSE_FILES |
+			 NT_FS_SUPPORTS_HARD_LINKS;
+
+		/*
+		 * Extended attributes are how this subsystem stores every
+		 * NT attribute it cannot derive, so a volume without them
+		 * is one where half the metadata layer silently does
+		 * nothing.  Say so rather than let a caller find out.
+		 */
+		if (sb->s_xattr)
+			flags |= NT_FS_SUPPORTS_EXTENDED_ATTRIBUTES;
+	}
+
+	if (sb_rdonly(sb) || (vol->flags & NT_VOL_READONLY))
+		flags |= NT_FS_READ_ONLY_VOLUME;
+
+	vol->fs_flags = flags;
+}
+
 /**
  * nt_volume_get - take a reference on a volume
  * @vol: the volume, may be NULL
@@ -221,6 +280,9 @@ struct nt_volume *nt_volume_create(struct nt_namespace *ns,
 	 */
 	if (nt_dir_is_native_ci(root->dentry))
 		vol->flags |= NT_VOL_NATIVE_CI;
+
+	/* After the flags above; READONLY feeds into the capability set. */
+	nt_volume_set_fs_flags(vol, sb, root->dentry);
 
 	if (label)
 		strscpy(vol->label, label, sizeof(vol->label));
@@ -592,13 +654,14 @@ void nt_volume_seq_show(struct seq_file *m, struct nt_volume *vol)
 {
 	struct super_block *sb = vol->root.dentry->d_sb;
 
-	seq_printf(m, "id=%u letter=%c: nt=%s guid={%pUl} serial=%08X fs=%s backing=%s label=\"%s\"%s%s%s\n",
+	seq_printf(m, "id=%u letter=%c: nt=%s guid={%pUl} serial=%08X fs=%s fsflags=%08x backing=%s label=\"%s\"%s%s%s\n",
 		   vol->id,
 		   vol->letter ? vol->letter : '-',
 		   vol->nt_device,
 		   &vol->guid,
 		   vol->serial,
 		   vol->fs_name,
+		   vol->fs_flags,
 		   sb->s_type ? sb->s_type->name : "?",
 		   vol->label,
 		   (vol->flags & NT_VOL_SYSTEM) ? " system" : "",

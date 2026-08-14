@@ -86,6 +86,9 @@ struct super_block;
  * @label:	volume label
  * @fs_name:	filesystem name reported to Win32 ("NTFS", "FAT32", ...)
  * @nt_device:	NT device name, e.g. "\Device\HarddiskVolume1"
+ * @fs_flags:	NT_FS_* capabilities, as GetVolumeInformation reports them.
+ *		Answered from what this volume can actually do, which is
+ *		not the same question as what @fs_name calls it.
  *
  * A volume is the binding between an NT drive letter and a Linux mount.
  * It deliberately does not duplicate the mount: @root holds a reference
@@ -108,6 +111,7 @@ struct nt_volume {
 	char			label[NT_MAX_LABEL + 1];
 	char			fs_name[NT_MAX_FS_NAME + 1];
 	char			nt_device[NT_VOL_DEVNAME_MAX];
+	u32			fs_flags;
 };
 
 /**

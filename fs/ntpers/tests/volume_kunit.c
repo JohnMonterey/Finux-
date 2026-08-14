@@ -491,6 +491,54 @@ static void test_resolve_rejects_unhandled_stream(struct kunit *test)
 	nt_volume_put(vol);
 }
 
+/*
+ * The reported capabilities describe what the volume does, not what its
+ * reported name implies.
+ *
+ * fs_name says "NTFS" for anything that can host the personality, which
+ * is a compatibility answer - there is no Win32 vocabulary for tmpfs.
+ * The flags are the honest half, and an application that is told it has
+ * named streams or persistent ACLs will go and use them, so a bit set
+ * here ahead of the feature is not an optimistic placeholder, it is a
+ * lie with a caller attached.
+ */
+static void test_fs_flags_are_honest(struct kunit *test)
+{
+	struct nt_vol_test_ctx *ctx = test->priv;
+	struct nt_volume *vol;
+
+	vol = nt_volume_create(ctx->ns, &ctx->root, 'C', 0, "System");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(vol));
+
+	/* True of every volume this can be mounted on. */
+	KUNIT_EXPECT_TRUE(test, vol->fs_flags & NT_FS_CASE_PRESERVED_NAMES);
+	KUNIT_EXPECT_TRUE(test, vol->fs_flags & NT_FS_UNICODE_ON_DISK);
+
+	/* tmpfs and ramfs are case-sensitive and neither folds. */
+	KUNIT_EXPECT_TRUE(test, vol->fs_flags & NT_FS_CASE_SENSITIVE_SEARCH);
+
+	/*
+	 * Not implemented, and each one is a promise an application will
+	 * act on.  These must stay clear until the feature behind them is
+	 * real - which is the point of the test.
+	 */
+	KUNIT_EXPECT_FALSE_MSG(test,
+			       vol->fs_flags & NT_FS_SUPPORTS_REPARSE_POINTS,
+			       "reparse points are Stage 4");
+	KUNIT_EXPECT_FALSE_MSG(test, vol->fs_flags & NT_FS_NAMED_STREAMS,
+			       "named streams are Stage 4");
+	KUNIT_EXPECT_FALSE_MSG(test, vol->fs_flags & NT_FS_PERSISTENT_ACLS,
+			       "security descriptors do not govern access yet");
+	KUNIT_EXPECT_FALSE_MSG(test,
+			       vol->fs_flags & NT_FS_SUPPORTS_OPEN_BY_FILE_ID,
+			       "file IDs are reported but cannot be opened");
+	KUNIT_EXPECT_FALSE(test, vol->fs_flags & NT_FS_SUPPORTS_ENCRYPTION);
+	KUNIT_EXPECT_FALSE(test, vol->fs_flags & NT_FS_SUPPORTS_USN_JOURNAL);
+
+	/* The name is still the compatibility answer. */
+	KUNIT_EXPECT_STREQ(test, vol->fs_name, "NTFS");
+}
+
 static struct kunit_case nt_volume_test_cases[] = {
 	KUNIT_CASE(test_create_and_lookup),
 	KUNIT_CASE(test_letter_conflict),
@@ -506,6 +554,7 @@ static struct kunit_case nt_volume_test_cases[] = {
 	KUNIT_CASE(test_resolve_drive_absolute),
 	KUNIT_CASE(test_resolve_follows_current_drive),
 	KUNIT_CASE(test_resolve_rejects_unhandled_stream),
+	KUNIT_CASE(test_fs_flags_are_honest),
 	{}
 };
 
