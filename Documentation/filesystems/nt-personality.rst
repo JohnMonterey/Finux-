@@ -133,6 +133,18 @@ the on-disk format: Win32 has no vocabulary for "ext4", and software
 branches on this string.  The real filesystem type is always visible in
 ``/proc/mounts`` and in the debugfs volume table.
 
+``fs_flags`` is the honest half of that answer.  It carries the
+``NT_FS_*`` capability bits ``GetVolumeInformation()`` returns in
+``lpFileSystemFlags``, and they are set from what the volume can actually
+do rather than from what the name implies.  The distinction matters
+because an application told it has named streams will open one.  So
+``NT_FS_SUPPORTS_REPARSE_POINTS``, ``NT_FS_NAMED_STREAMS`` and
+``NT_FS_SUPPORTS_OPEN_BY_FILE_ID`` are clear until those features exist,
+and ``NT_FS_PERSISTENT_ACLS`` is clear because security descriptors are
+stored but do not yet govern access.  A capability bit set ahead of its
+feature is not an optimistic placeholder; it is a promise with a caller
+attached.
+
 ``struct nt_namespace``
 -----------------------
 
@@ -272,6 +284,16 @@ it::
     mount /dev/sda2 /mnt/c
     chattr +F /mnt/c
 
+Casefolding is a property of each *directory*, not of the filesystem, so
+a tree can be mixed: ``+F`` is inherited at creation, but a directory
+that predates the flag does not have it and cannot be given it while it
+is non-empty.  ``NT_VOL_NATIVE_CI`` is therefore only a hint - it records
+what the volume *root* does.  When the fast path uses it and the lookup
+returns ``-ENOENT``, the resolver retries through tier 2 before believing
+the name is absent, because the miss may only mean some directory along
+the way does not fold.  The retry costs nothing on the common path, where
+the fast path succeeds.
+
 Tier 2: the filesystem is case-sensitive
 ----------------------------------------
 
@@ -297,7 +319,14 @@ Known limitations of tier 2, stated plainly:
   component takes a reference.
 * It does not follow symlinks in the middle of a path; such a component
   stops the walk with ``-ELOOP`` rather than resolving to something the
-  caller did not ask for.
+  caller did not ask for.  A symlink as the **final** component is
+  handled: with ``NT_RESOLVE_FOLLOW`` the component is handed to
+  ``vfs_path_lookup()`` under its real on-disk spelling so that the VFS
+  does the loop counting and nesting limits, and without the flag the
+  link itself is returned, which is what a create carrying
+  ``FILE_OPEN_REPARSE_POINT`` wants.  The link *target* resolves
+  case-sensitively - it is a Linux path stored on a filesystem that does
+  not fold.
 * The first touch of each differently-cased name reads a directory.
 * It needs *read* permission on a directory, not merely search
   permission, to match a name by a casing other than the stored one.  On
@@ -449,14 +478,26 @@ Anything derived is recomputed on every query, because every one of those
 can change through an ordinary POSIX operation that has no reason to
 report it.  Storing them would only let them go stale.
 
-``READONLY`` is backed by the file mode rather than stored, so the Linux
-and NT answers to "can this be written?" cannot disagree.  Setting it
-removes write permission from everyone; clearing it restores write
-permission **to the owner only**.  That asymmetry is deliberate: a DOS
-attribute carries no information about who should be able to write, so
-the only safe reconstruction is the least privileged one.  Mirroring the
-read bits instead would turn an ordinary 0644 file into 0666 every time a
-Windows program cleared a read-only flag.
+``READONLY`` is backed by the file mode rather than stored on its own, so
+that it genuinely prevents writes and so that the Linux and NT answers to
+"can this be written?" cannot disagree.  Windows applies it per-file
+rather than per-user, so setting it removes write permission from
+everybody.
+
+Putting it back is the hard half.  A DOS attribute carries no information
+about *who* should be able to write, so the attribute alone cannot
+reconstruct the mode.  Guessing wide - mirroring the read bits - turns an
+ordinary 0644 into 0666 and grants access nobody asked for.  Guessing
+narrow - owner write only - is safe but lossy: 0664 comes back as 0644
+and the group silently loses write access.
+
+So the write bits that were removed are recorded in
+``user.nt.saved_write`` and exactly those bits are restored, ORed into
+whatever the mode is at the time.  A ``chmod`` made while the file was
+read-only therefore survives rather than being rolled back, and a round
+trip through ``READONLY`` is lossless.  Filesystems and file types that
+will not carry a ``user.*`` xattr fall back to the narrow guess, which is
+the right failure mode: it never grants access that was not there before.
 
 On the xattr namespace, which is a security question rather than a naming
 one:
@@ -496,8 +537,8 @@ NT                   Linux
 ``LastWriteTime``    ``mtime``
 ``LastAccessTime``   ``atime``
 ``ChangeTime``       ``ctime`` - metadata change time, the correct match
-``CreationTime``     ``statx`` ``btime`` where the filesystem has one,
-                     otherwise a stored value, otherwise an estimate
+``CreationTime``     a value set through ``nt_set_creation_time()``,
+                     otherwise ``statx`` ``btime``, otherwise an estimate
 ===================  ====================================================
 
 ``ctime`` is **not** ``CreationTime``.  It is the inode change time, and
@@ -508,8 +549,15 @@ the difference can tell.  Exactly one of ``NT_TIME_CREATION_EXACT`` and
 ``NT_TIME_CREATION_ESTIMATED`` is always set; the KUnit suite asserts
 that.
 
-A stored creation time is only consulted when the filesystem has no birth
-time of its own, because the real birth time is always the better answer.
+A stored creation time takes precedence over the filesystem's own birth
+time, and that ordering is deliberate.  No filesystem lets anything
+change its birth time, so ``nt_set_creation_time()`` has to store the
+value alongside; if the query then preferred ``btime``, a Windows
+``SetFileTime(...CreationTime...)`` would report success and change
+nothing observable.  Installers and archive extractors do that call
+routinely and expect it to mean something.  Reporting the inode's birth
+time is the better answer to a POSIX question, and this is not one - the
+POSIX answer is still in ``statx`` for anything that wants it.
 
 NT time is 100ns units since 1601-01-01;
 ``nt_time_from_timespec()``/``nt_time_to_timespec()`` are the conversion,

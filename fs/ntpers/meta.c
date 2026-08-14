@@ -77,6 +77,12 @@
 #define NT_XATTR_CREATION_TIME	"user.nt.crtime"
 #define NT_XATTR_SECURITY	"security.nt.sd"
 
+/*
+ * The write bits READONLY took away, so that clearing it can put back
+ * exactly what was there.  See nt_apply_readonly().
+ */
+#define NT_XATTR_SAVED_WRITE	"user.nt.saved_write"
+
 /* A security descriptor larger than this is not one we want to store. */
 #define NT_SD_MAX_SIZE		65536
 
@@ -298,16 +304,29 @@ EXPORT_SYMBOL_GPL(nt_get_file_attributes);
 /*
  * Apply the READONLY bit to the file mode.
  *
- * Setting it removes write permission from everyone, which is the whole
- * point of the attribute.  Clearing it restores write permission to the
- * owner only.
+ * READONLY is backed by the mode rather than stored on its own, so that
+ * it actually prevents writes instead of merely claiming to, and so that
+ * chmod and SetFileAttributes cannot disagree.  Windows applies it
+ * per-file rather than per-user, so setting it takes write permission
+ * away from everybody.
  *
- * The asymmetry is deliberate.  A DOS attribute carries no information
- * about *who* should be able to write, so the only safe reconstruction is
- * the least privileged one that satisfies the request.  Granting group or
- * other write here - for instance by mirroring the read bits, which would
- * turn a perfectly ordinary 0644 file into 0666 - would silently widen
- * access every time a Windows program cleared a read-only flag.
+ * The problem is putting it back.  A DOS attribute carries no
+ * information about *who* should be able to write, so a round trip
+ * through READONLY has no way to reconstruct the mode from the attribute
+ * alone.  Guessing wide - mirroring the read bits - turns an ordinary
+ * 0644 into 0666 and silently grants access every time a Windows program
+ * clears a read-only flag.  Guessing narrow - restoring owner write only
+ * - is safe but lossy: 0664 comes back as 0644 and the group quietly
+ * loses write access.
+ *
+ * So do not guess.  Record the write bits that were removed and restore
+ * those exact bits.  Only the write bits are saved and only they are put
+ * back, ORed into whatever the mode is at the time, so a chmod made while
+ * the file was read-only is preserved rather than reverted.
+ *
+ * Filesystems and file types that refuse a user.* xattr fall back to the
+ * narrow guess.  That is the old lossy behaviour, which is the right
+ * failure mode: it never grants access that was not there before.
  */
 static int nt_apply_readonly(const struct path *path, bool readonly)
 {
@@ -315,21 +334,51 @@ static int nt_apply_readonly(const struct path *path, bool readonly)
 	struct inode *inode = d_inode(path->dentry);
 	umode_t mode = inode->i_mode;
 	umode_t want;
+	u8 saved;
 	int err;
 
-	if (readonly)
+	if (readonly) {
 		want = mode & ~S_IWUGO;
-	else
-		want = mode | S_IWUSR;
+		if (want == mode)
+			return 0;
 
-	if (want == mode)
-		return 0;
+		/*
+		 * Save before changing anything.  If this fails the
+		 * attribute is still applied - refusing to honour
+		 * SetFileAttributes because an xattr would not stick
+		 * would be a worse outcome than an imprecise restore.
+		 */
+		saved = mode & S_IWUGO;
+		vfs_setxattr(nt_idmap(path), path->dentry,
+			     NT_XATTR_SAVED_WRITE, &saved, sizeof(saved), 0);
+	} else {
+		if (nt_read_xattr_le(path, NT_XATTR_SAVED_WRITE, &saved,
+				     sizeof(saved)) == 0)
+			want = mode | (saved & S_IWUGO);
+		else
+			want = mode | S_IWUSR;
+
+		if (want == mode) {
+			vfs_removexattr(nt_idmap(path), path->dentry,
+					NT_XATTR_SAVED_WRITE);
+			return 0;
+		}
+	}
 
 	attr.ia_mode = want;
 
 	inode_lock(inode);
 	err = notify_change(nt_idmap(path), path->dentry, &attr, NULL);
 	inode_unlock(inode);
+
+	/*
+	 * The saved bits describe a read-only file and mean nothing once it
+	 * is writable again.  Leaving them would make a later clear restore
+	 * a mode from two changes ago.
+	 */
+	if (!err && !readonly)
+		vfs_removexattr(nt_idmap(path), path->dentry,
+				NT_XATTR_SAVED_WRITE);
 
 	return err;
 }
@@ -412,9 +461,19 @@ EXPORT_SYMBOL_GPL(nt_set_file_attributes);
  * creation time; NT's ChangeTime is what ctime corresponds to.  The
  * sources for a real creation time, in order:
  *
- *   1. statx STATX_BTIME, where the filesystem records a birth time.
- *   2. A value stored here earlier, for filesystems that do not.
+ *   1. A value a caller set through nt_set_creation_time().
+ *   2. statx STATX_BTIME, where the filesystem records a birth time.
  *   3. Nothing, in which case we estimate and say so.
+ *
+ * The stored value comes first, and that ordering is the whole point.
+ * SetFileTime() with a CreationTime is a normal thing for a Windows
+ * installer or archive extractor to do, and it means "this file was
+ * created then".  Preferring the inode's birth time would make the call
+ * report success and change nothing observable, which is worse than
+ * refusing it.  This layer exists to behave like Windows, not to defend
+ * the filesystem's opinion about when the inode appeared - and the
+ * filesystem's own birth time is still there in statx for anything that
+ * wants the POSIX answer.
  */
 static void nt_resolve_creation_time(const struct path *path,
 				     const struct kstat *stat,
@@ -422,15 +481,15 @@ static void nt_resolve_creation_time(const struct path *path,
 {
 	__le64 stored;
 
-	if (stat->result_mask & STATX_BTIME) {
-		info->creation = stat->btime;
+	if (!nt_read_xattr_le(path, NT_XATTR_CREATION_TIME, &stored,
+			      sizeof(stored))) {
+		nt_time_to_timespec(le64_to_cpu(stored), &info->creation);
 		info->time_flags |= NT_TIME_CREATION_EXACT;
 		return;
 	}
 
-	if (!nt_read_xattr_le(path, NT_XATTR_CREATION_TIME, &stored,
-			      sizeof(stored))) {
-		nt_time_to_timespec(le64_to_cpu(stored), &info->creation);
+	if (stat->result_mask & STATX_BTIME) {
+		info->creation = stat->btime;
 		info->time_flags |= NT_TIME_CREATION_EXACT;
 		return;
 	}
@@ -450,13 +509,15 @@ static void nt_resolve_creation_time(const struct path *path,
  * @path: the file
  * @ts:   the time
  *
- * Filesystems that keep a birth time do not let anything change it, so
- * this stores a value alongside instead.  A stored value is only
- * consulted when the filesystem has no birth time of its own, so this is
- * a no-op in observable terms on ext4 or btrfs - which is the correct
- * outcome, because the real birth time is the better answer.
+ * No filesystem lets anything change its own birth time, so this stores
+ * the value alongside.  nt_query_file_info() then prefers what is stored
+ * here over statx's btime, so the caller sees the time it set - which is
+ * what SetFileTime() promises.  The filesystem's birth time is unchanged
+ * and still visible through statx to anything that wants it.
  *
- * Returns 0 or a negative errno.
+ * Returns 0 or a negative errno.  In particular -EOPNOTSUPP or -EPERM
+ * from a filesystem or file type that will not carry a user.* xattr,
+ * which is a real failure and must not be reported as success.
  */
 int nt_set_creation_time(const struct path *path, const struct timespec64 *ts)
 {

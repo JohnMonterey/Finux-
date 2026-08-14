@@ -203,6 +203,105 @@ static void test_attrs_readonly_roundtrip_preserves_mode(struct kunit *test)
 }
 
 /*
+ * The round trip has to preserve write bits it did not grant, too.
+ *
+ * The test above starts at 0644, where the only write bit is the owner's
+ * and restoring "owner write" happens to be exactly right - so it passes
+ * whether the old mode was remembered or guessed.  0664 is where the
+ * guess loses: strip every write bit, put back only the owner's, and the
+ * group has silently lost access that the file had before Windows
+ * touched it.
+ */
+static void test_attrs_readonly_roundtrip_preserves_group_write(
+							struct kunit *test)
+{
+	struct iattr attr = { .ia_valid = ATTR_MODE };
+	struct dentry *file;
+	struct inode *inode;
+	struct path path;
+	int err;
+
+	file = nt_meta_create(test, "GroupWrite.txt", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+	inode = d_inode(file);
+
+	/*
+	 * setattr_copy() assigns i_mode verbatim, so the file type bits
+	 * have to be carried through or the inode stops being a regular
+	 * file and every later operation fails for the wrong reason.
+	 */
+	attr.ia_mode = (inode->i_mode & ~0777) | 0664;
+
+	inode_lock(inode);
+	err = notify_change(&nop_mnt_idmap, file, &attr, NULL);
+	inode_unlock(inode);
+	KUNIT_ASSERT_EQ(test, err, 0);
+	KUNIT_ASSERT_EQ(test, inode->i_mode & 0777, 0664);
+
+	KUNIT_ASSERT_EQ(test, nt_set_file_attributes(&path,
+						NT_FILE_ATTRIBUTE_READONLY), 0);
+	/* Read-only means nobody writes, including the group. */
+	KUNIT_EXPECT_EQ(test, inode->i_mode & 0777, 0444);
+
+	KUNIT_ASSERT_EQ(test, nt_set_file_attributes(&path,
+						NT_FILE_ATTRIBUTE_ARCHIVE), 0);
+	KUNIT_EXPECT_EQ_MSG(test, inode->i_mode & 0777, 0664,
+			    "clearing READONLY lost the group write bit");
+}
+
+/*
+ * A chmod made while the file is read-only is not reverted by clearing
+ * the attribute.
+ *
+ * Only the write bits are saved and only they are restored, so an
+ * unrelated permission change in between survives.  Restoring the whole
+ * saved mode would quietly undo it.
+ */
+static void test_attrs_readonly_restore_is_not_a_rollback(struct kunit *test)
+{
+	struct iattr attr = { .ia_valid = ATTR_MODE };
+	struct dentry *file;
+	struct inode *inode;
+	struct path path;
+	int err;
+
+	file = nt_meta_create(test, "Chmodded.txt", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+	inode = d_inode(file);
+
+	/* Type bits carried through; see the note in the test above. */
+	attr.ia_mode = (inode->i_mode & ~0777) | 0664;
+	inode_lock(inode);
+	err = notify_change(&nop_mnt_idmap, file, &attr, NULL);
+	inode_unlock(inode);
+	KUNIT_ASSERT_EQ(test, err, 0);
+
+	KUNIT_ASSERT_EQ(test, nt_set_file_attributes(&path,
+						NT_FILE_ATTRIBUTE_READONLY), 0);
+
+	/* Somebody drops the group's read access while it is read-only. */
+	attr.ia_mode = (inode->i_mode & ~0777) | 0404;
+	inode_lock(inode);
+	err = notify_change(&nop_mnt_idmap, file, &attr, NULL);
+	inode_unlock(inode);
+	KUNIT_ASSERT_EQ(test, err, 0);
+
+	KUNIT_ASSERT_EQ(test, nt_set_file_attributes(&path,
+						NT_FILE_ATTRIBUTE_ARCHIVE), 0);
+
+	/*
+	 * 0664 saved 0220, the chmod left 0404, so clearing READONLY ORs
+	 * the two into 0624: both write bits are back where they were, and
+	 * the group's lost read bit stays lost.  A rollback would have
+	 * produced 0664 and silently undone the chmod.
+	 */
+	KUNIT_EXPECT_EQ_MSG(test, inode->i_mode & 0777, 0624,
+			    "restore should add write bits, not roll back");
+}
+
+/*
  * The filesystem owns DIRECTORY and the rest of the derived bits.  A
  * caller cannot set them, and trying must not corrupt what is stored.
  */
@@ -318,7 +417,16 @@ static void test_creation_time_is_honest(struct kunit *test)
 	}
 }
 
-/* A stored creation time is used when the filesystem has none. */
+/*
+ * A creation time the caller set is the one the caller reads back.
+ *
+ * This used to assert the opposite - that a filesystem's birth time
+ * outranked a stored value because it was "the better answer".  It is
+ * the better answer to a POSIX question, and the wrong one here:
+ * SetFileTime(...CreationTime...) is something Windows installers and
+ * archive extractors do routinely, and a call that reports success while
+ * changing nothing observable is worse than one that fails.
+ */
 static void test_creation_time_stored(struct kunit *test)
 {
 	struct timespec64 want = { .tv_sec = 1000000000, .tv_nsec = 0 };
@@ -343,14 +451,25 @@ static void test_creation_time_stored(struct kunit *test)
 
 	KUNIT_EXPECT_TRUE(test, info.time_flags & NT_TIME_CREATION_EXACT);
 
+	/*
+	 * Whether or not the filesystem keeps a birth time of its own, the
+	 * value the caller set is the value it gets back.
+	 */
+	KUNIT_EXPECT_EQ_MSG(test, info.creation.tv_sec, want.tv_sec,
+			    "an explicit CreationTime must win over btime");
+	KUNIT_EXPECT_EQ(test, info.creation.tv_nsec, want.tv_nsec);
+
 	if (stat.result_mask & STATX_BTIME) {
 		/*
-		 * A real birth time outranks a stored one; that is the
-		 * better answer and must not be overridden.
+		 * ...and the inode's own birth time is untouched by it.
+		 * Nothing here rewrites the filesystem's idea of when the
+		 * file appeared; statx still answers the POSIX question.
 		 */
-		KUNIT_EXPECT_EQ(test, info.creation.tv_sec, stat.btime.tv_sec);
+		KUNIT_EXPECT_NE_MSG(test, stat.btime.tv_sec, want.tv_sec,
+				    "test is vacuous: btime already matched");
 	} else {
-		KUNIT_EXPECT_EQ(test, info.creation.tv_sec, want.tv_sec);
+		kunit_info(test,
+			   "no STATX_BTIME here, so precedence is untested");
 	}
 }
 
@@ -591,6 +710,8 @@ static struct kunit_case nt_meta_test_cases[] = {
 	KUNIT_CASE(test_attrs_set_and_get),
 	KUNIT_CASE(test_attrs_readonly_follows_mode),
 	KUNIT_CASE(test_attrs_readonly_roundtrip_preserves_mode),
+	KUNIT_CASE(test_attrs_readonly_roundtrip_preserves_group_write),
+	KUNIT_CASE(test_attrs_readonly_restore_is_not_a_rollback),
 	KUNIT_CASE(test_attrs_fs_owned_bits_ignored),
 	KUNIT_CASE(test_attrs_reject_invalid),
 	KUNIT_CASE(test_times_map_correctly),
