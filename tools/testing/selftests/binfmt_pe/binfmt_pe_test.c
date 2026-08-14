@@ -3,17 +3,20 @@
  * End-to-end selftest for the PE/COFF binary loader (CONFIG_BINFMT_PE).
  *
  * This builds a minimal but genuine 64-bit PE executable on disk - an MZ
- * header, a PE header, one .text section - whose entry point issues the
- * Linux exit(42) system call.  It then execve()s the file and checks that
- * the kernel recognised it, mapped the image, and transferred control: the
- * child process exits with status 42.
+ * header, a PE header, one .text section - whose entry point calls the NT
+ * service NtTerminateProcess(NT_CURRENT_PROCESS, 42).  It then execve()s the
+ * file and checks that the kernel recognised it, mapped the image, made it
+ * an NT process, and transferred control: the child process exits with
+ * status 42.
  *
- * The payload deliberately uses a Linux system call.  This milestone is
- * the loader; the NT system-call surface that a real Windows program would
- * reach through ntdll does not exist yet.  So the test proves precisely
- * what the loader promises - parse the headers, map the sections, jump to
- * the entry point - and nothing it does not yet do.  A binary that needed
- * imports resolved, or its base relocated, is out of scope here.
+ * The payload issues an NT system call, not a Linux one.  The loader now
+ * puts a loaded PE into NT syscall mode, so its `syscall` instruction is
+ * dispatched through the NT service table by the Windows x64 convention -
+ * the service number in eax, argument one in r10, argument two in edx - and
+ * a Linux exit(42) here would be misdispatched.  So these tests exercise the
+ * whole chain: parse the headers, map the sections, enter NT mode, jump to
+ * the entry point, and reach an NT service, end to end.  Import resolution
+ * is still out of scope.
  *
  * If the running kernel was built without CONFIG_BINFMT_PE the execve()
  * fails with ENOEXEC and the test is skipped.
@@ -44,6 +47,15 @@
 #define PE_SCN_MEM_EXECUTE		0x20000000
 #define PE_SCN_MEM_READ			0x40000000
 #define PE_SCN_MEM_WRITE		0x80000000
+
+/*
+ * NT system-call surface (see <uapi/linux/nt_personality.h>).  The payloads
+ * below drive the raw `syscall` convention directly, so they only need the
+ * service number and the current-process pseudo-handle; the bytes are given
+ * literally and these are here to name them.
+ */
+#define NT_SYS_NtTerminateProcess	6
+#define NT_CURRENT_PROCESS		(-1L)	/* GetCurrentProcess(), (HANDLE)-1 */
 
 #define PE_PAGE		0x1000UL
 #define PE_HDR_OFF	0x80		/* where we place the PE header */
@@ -110,24 +122,34 @@ struct __attribute__((packed)) pe_section {
 };
 
 /*
- * x86-64 entry payload: exit(42).
- *   mov edi, 42      ; status
- *   mov eax, 60      ; __NR_exit
+ * x86-64 entry payload: NtTerminateProcess(NT_CURRENT_PROCESS, 42).
+ *
+ * The Windows x64 system-service convention: the NT service number in eax,
+ * argument one (the process handle) in r10, argument two (the exit status)
+ * in edx, then `syscall`.  Assembled with the host assembler; the loader has
+ * put the task in NT syscall mode, so this reaches NtTerminateProcess.
+ *
+ *   mov eax, 6                ; NT_SYS_NtTerminateProcess
+ *   mov r10, -1               ; NT_CURRENT_PROCESS ((HANDLE)-1)
+ *   mov edx, 42               ; exit status
  *   syscall
  */
 static const uint8_t pe_entry_code[] = {
-	0xbf, 0x2a, 0x00, 0x00, 0x00,
-	0xb8, 0x3c, 0x00, 0x00, 0x00,
-	0x0f, 0x05,
+	0xb8, 0x06, 0x00, 0x00, 0x00,			/* mov eax,6	     */
+	0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff,	/* mov r10,-1	     */
+	0xba, 0x2a, 0x00, 0x00, 0x00,			/* mov edx,42	     */
+	0x0f, 0x05,					/* syscall	     */
 };
 
 /*
- * x86-64 entry payload that checks its own base relocation.  It reads a
- * pointer that .reloc fixes up (stored at RVA 0x2000, initially base+0x2000)
- * and confirms the loader made it equal to (actual load base) + 0x2000.  It
- * exits 42 when the image was relocated and the fixup is right, 43 when the
- * image loaded at its preferred base (also right), and 1 when the fixup is
- * wrong.  Assembled from:
+ * x86-64 entry payload that checks its own base relocation, then exits
+ * through NtTerminateProcess(NT_CURRENT_PROCESS, status).  It reads a pointer
+ * that .reloc fixes up (stored at RVA 0x2000, initially base+0x2000) and
+ * confirms the loader made it equal to (actual load base) + 0x2000.  It exits
+ * 42 when the image was relocated and the fixup is right, 43 when the image
+ * loaded at its preferred base (also right), and 1 when the fixup is wrong.
+ * The status is carried in edx (NtTerminateProcess argument two).  Assembled
+ * with the host assembler from:
  *
  *   lea  rbx, [rip - 7]        ; rbx = &_start = base + 0x1000
  *   sub  rbx, 0x1000           ; rbx = actual load base
@@ -138,11 +160,13 @@ static const uint8_t pe_entry_code[] = {
  *   mov  rcx, 0x10000          ; preferred ImageBase
  *   cmp  rbx, rcx
  *   je   preferred
- *   mov  edi, 42
+ *   mov  edx, 42
  *   jmp  done
- *   preferred: mov edi, 43; jmp done
- *   fail:      mov edi, 1
- *   done:      mov eax, 60; syscall
+ *   preferred: mov edx, 43; jmp done
+ *   fail:      mov edx, 1
+ *   done:      mov eax, 6      ; NT_SYS_NtTerminateProcess
+ *              mov r10, -1     ; NT_CURRENT_PROCESS
+ *              syscall
  */
 static const uint8_t pe_reloc_code[] = {
 	0x48, 0x8d, 0x1d, 0xf9, 0xff, 0xff, 0xff,	/* lea rbx,[rip-7]   */
@@ -154,12 +178,13 @@ static const uint8_t pe_reloc_code[] = {
 	0x48, 0xc7, 0xc1, 0x00, 0x00, 0x01, 0x00,	/* mov rcx,0x10000   */
 	0x48, 0x39, 0xcb,				/* cmp rbx,rcx	     */
 	0x74, 0x07,					/* je preferred	     */
-	0xbf, 0x2a, 0x00, 0x00, 0x00,			/* mov edi,42	     */
+	0xba, 0x2a, 0x00, 0x00, 0x00,			/* mov edx,42	     */
 	0xeb, 0x0c,					/* jmp done	     */
-	0xbf, 0x2b, 0x00, 0x00, 0x00,			/* mov edi,43	     */
+	0xba, 0x2b, 0x00, 0x00, 0x00,			/* mov edx,43	     */
 	0xeb, 0x05,					/* jmp done	     */
-	0xbf, 0x01, 0x00, 0x00, 0x00,			/* mov edi,1	     */
-	0xb8, 0x3c, 0x00, 0x00, 0x00,			/* mov eax,60	     */
+	0xba, 0x01, 0x00, 0x00, 0x00,			/* mov edx,1	     */
+	0xb8, 0x06, 0x00, 0x00, 0x00,			/* mov eax,6	     */
+	0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff,	/* mov r10,-1	     */
 	0x0f, 0x05,					/* syscall	     */
 };
 

@@ -13,18 +13,26 @@
  * This is the *loader*: it turns a PE file on disk into a running image.
  * That means header validation, mapping each section at its preferred
  * address with the memory protection the section asks for, zero-filling
- * the uninitialised tail (.bss), and starting the thread at the entry
- * point.  It is enough to run a freestanding native PE - one that makes
- * its own system calls and imports nothing.
+ * the uninitialised tail (.bss), applying base relocations when the image
+ * cannot get its preferred address, and starting the thread at the entry
+ * point.
+ *
+ * When CONFIG_NT_FS_PERSONALITY is on it then turns that image into an NT
+ * process (see pe_setup_nt_process()): the task enters NT syscall mode so
+ * its `syscall` instructions dispatch through the NT service table rather
+ * than the Linux one, it resolves pathnames by NT rules, and it starts with
+ * a minimal TEB/PEB laid out in memory and %gs pointing at the TEB - which
+ * is what a freestanding native PE needs to reach the kernel the way every
+ * real Windows binary does, through NT services rather than Linux ones.
  *
  * It deliberately stops there.  A real Windows program additionally needs
  *
  *   - its imports resolved against ntdll/kernel32 and friends,
- *   - the NT process environment block (PEB/TEB) laid out in memory,
- *   - base relocations applied when it cannot get its preferred address,
- *   - and the NT system-call surface behind ntdll.
+ *   - the full RtlUserThreadStart entry protocol and the process-parameter
+ *     block the PEB points at (this loader lays out only the handful of
+ *     TEB/PEB fields ntdll and the CRT read to find themselves).
  *
- * None of those are needed to *load* the image, so none of them live here.
+ * Neither is needed to *load and start* the image, so neither lives here.
  * They are built on top of this loader.  Where this file makes a
  * simplifying assumption it rejects the image with -ENOEXEC rather than
  * loading it wrongly; those boundaries are called out at each check.
@@ -50,6 +58,16 @@
 #include <linux/pe.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/nt_syscall.h>
+#include <linux/nt_personality.h>
+#ifdef CONFIG_NT_FS_PERSONALITY
+#include <asm/prctl.h>		/* ARCH_SET_GS */
+#ifdef CONFIG_UML
+#include <asm/ptrace.h>		/* arch_prctl() */
+#else
+#include <asm/proto.h>		/* do_arch_prctl_64() */
+#endif
+#endif
 
 /*
  * Bounds we impose on a PE image.  These are sanity limits, not format
@@ -491,6 +509,116 @@ out:
 	return err;
 }
 
+#ifdef CONFIG_NT_FS_PERSONALITY
+
+/*
+ * 64-bit NT thread environment block, as ntdll and the MSVC CRT read it
+ * through %gs.  These are the real Windows x64 field offsets: NT_TIB and the
+ * TEB from winnt.h, the PEB from winternl.h.  A native thread finds its own
+ * TEB at gs:[0x30] (NT_TIB.Self), its stack bounds at gs:[0x08]/gs:[0x10],
+ * and its PEB at gs:[0x60]; the PEB in turn names the image base at PEB+0x10.
+ *
+ * We lay out a minimal TEB and PEB in a single user page and leave every
+ * other field zero, which is a valid (empty) value for all of them.  The
+ * PEB is placed well clear of the TEB fields we populate so the two never
+ * overlap; both assertions below hold that layout.
+ */
+#define NT_TEB_STACK_BASE	0x08	/* NT_TIB.StackBase  - top of the stack */
+#define NT_TEB_STACK_LIMIT	0x10	/* NT_TIB.StackLimit - bottom of the stack */
+#define NT_TEB_SELF		0x30	/* NT_TIB.Self       - the TEB itself */
+#define NT_TEB_PEB		0x60	/* TEB.ProcessEnvironmentBlock */
+#define NT_PEB_OFFSET		0x800	/* where the PEB sits within the page */
+#define NT_PEB_IMAGE_BASE	0x10	/* PEB.ImageBaseAddress */
+
+static_assert(NT_TEB_PEB + sizeof(u64) < NT_PEB_OFFSET,
+	      "the PEB overlaps the populated TEB fields");
+static_assert(NT_PEB_OFFSET + NT_PEB_IMAGE_BASE + sizeof(u64) <= PAGE_SIZE,
+	      "the TEB and PEB do not fit in one page");
+
+/*
+ * Point this task's %gs at its TEB.
+ *
+ * On native x86-64 the user GS base is installed with do_arch_prctl_64(),
+ * which for task == current loads a null GS selector and writes the inactive
+ * (user) GS-base MSR that becomes active on return to user mode.  UML has no
+ * MSR to write; it records the guest GS base in the task's ptrace register
+ * set (arch/x86/um/syscalls_64.c) and restores it into the host process
+ * whenever the guest runs - via PTRACE_SETREGS, or the seccomp stub's own
+ * arch_prctl (arch/x86/um/os-Linux/mcontext.c, arch/x86/um/shared/sysdep/
+ * stub_64.h) - so the native PE really does see gs:[...] resolve against the
+ * TEB there too.  The TEB address came from vm_mmap() in this mm, so it is a
+ * valid user address neither setter can reject.
+ */
+static int pe_set_gs_base(unsigned long teb)
+{
+#ifdef CONFIG_UML
+	return arch_prctl(current, ARCH_SET_GS, (unsigned long __user *)teb);
+#else
+	return do_arch_prctl_64(current, ARCH_SET_GS, teb);
+#endif
+}
+
+/*
+ * Turn the just-mapped image into an NT process and lay out its thread
+ * environment.  Enters NT syscall mode, sets the NT personality so pathnames
+ * resolve by Windows rules, allocates one user page for the TEB and PEB, and
+ * fills in the minimal set of fields a native PE reads to find itself.  The
+ * TEB address is returned in @teb_out for pe_set_gs_base(), which must run
+ * after start_thread() (see the call site).
+ *
+ * Runs past the point of no return, so a failure returns a negative errno
+ * and the caller tears the process down, exactly as the mapping failures do.
+ */
+static int pe_setup_nt_process(unsigned long load_base, unsigned long sp,
+			       unsigned long *teb_out)
+{
+	unsigned long teb, peb, stack_base, stack_limit;
+	int retval;
+
+	/* Dispatch this task's `syscall` through the NT service table. */
+	nt_syscall_mode_set(current);
+
+	/* Resolve its pathnames the way Windows does (case-insensitive). */
+	retval = nt_personality_set(NT_PERSONALITY_ENABLED |
+				    NT_PERSONALITY_CASE_INSENSITIVE);
+	if (retval)
+		return retval;
+
+	/* One anonymous, zero-filled page holds both the TEB and the PEB. */
+	teb = vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, 0);
+	if (IS_ERR_VALUE(teb))
+		return (int)teb;
+	peb = teb + NT_PEB_OFFSET;
+
+	/*
+	 * The stack was set up growing down from STACK_TOP; NT_TIB records its
+	 * high bound as StackBase and the lowest committed page as StackLimit.
+	 */
+	stack_base = STACK_TOP;
+	stack_limit = sp & PAGE_MASK;
+
+	/*
+	 * The page is all zero already, so only the non-zero fields are
+	 * written.  put_user() faults the page in; it can fail only on an
+	 * unmapped address, which this freshly mapped page is not.
+	 */
+	if (put_user(stack_base,
+		     (unsigned long __user *)(teb + NT_TEB_STACK_BASE)) ||
+	    put_user(stack_limit,
+		     (unsigned long __user *)(teb + NT_TEB_STACK_LIMIT)) ||
+	    put_user(teb, (unsigned long __user *)(teb + NT_TEB_SELF)) ||
+	    put_user(peb, (unsigned long __user *)(teb + NT_TEB_PEB)) ||
+	    put_user(load_base,
+		     (unsigned long __user *)(peb + NT_PEB_IMAGE_BASE)))
+		return -EFAULT;
+
+	*teb_out = teb;
+	return 0;
+}
+
+#endif /* CONFIG_NT_FS_PERSONALITY */
+
 static int load_pe_binary(struct linux_binprm *bprm)
 {
 	struct file *file = bprm->file;
@@ -501,6 +629,9 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	struct pt_regs *regs = current_pt_regs();
 	struct mm_struct *mm;
 	unsigned long reserve, load_base, delta, sp;
+#ifdef CONFIG_NT_FS_PERSONALITY
+	unsigned long teb;
+#endif
 	u32 peaddr;
 	int retval, i;
 
@@ -671,17 +802,48 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	mm->start_stack = bprm->p;
 	mm->start_brk = mm->brk = PAGE_ALIGN(load_base + pi.image_size);
 
+	sp = bprm->p & ~15UL;
+
+#ifdef CONFIG_NT_FS_PERSONALITY
+	/*
+	 * Turn the loaded image into an NT process before it runs: enter NT
+	 * syscall mode, set the NT personality, and lay out its TEB/PEB.  Every
+	 * real Windows PE reaches the kernel only through the NT services in
+	 * ntdll, so from its first instruction this task must speak the NT ABI,
+	 * not the Linux one.  Done here, once the address space is fully built
+	 * and past the point of no return - a failure now tears the process
+	 * down, the same as the mapping failures above.
+	 */
+	retval = pe_setup_nt_process(load_base, sp, &teb);
+	if (retval)
+		goto out_free;
+#endif
+
 	set_binfmt(&pe_format);
 	finalize_exec(bprm);
 
 	/*
 	 * Hand control to the entry point on a 16-byte-aligned stack.  A full
-	 * Windows startup (RtlUserThreadStart, the PEB/TEB and the process
-	 * parameter block) is future work; a freestanding native PE only
-	 * needs a valid, aligned stack, which is what it gets here.
+	 * Windows startup (the RtlUserThreadStart entry protocol and the
+	 * process-parameter block the PEB points at) is future work; a
+	 * freestanding native PE needs only a valid, aligned stack, its TEB/PEB
+	 * (laid out above), and %gs pointing at the TEB (set just below).
 	 */
-	sp = bprm->p & ~15UL;
 	start_thread(regs, load_base + pi.entry, sp);
+
+#ifdef CONFIG_NT_FS_PERSONALITY
+	/*
+	 * Install the TEB as this thread's GS base.  It has to happen after
+	 * start_thread(), which resets the GS base while giving the new thread
+	 * a clean segment state; doing it here makes gs:[0x30] resolve to the
+	 * TEB from the PE's first instruction.  The address is a valid user
+	 * mapping, so this cannot fail; a failure all the same tears the
+	 * process down, since control has already left the old program.
+	 */
+	retval = pe_set_gs_base(teb);
+	if (retval)
+		goto out_free;
+#endif
 	return 0;
 
 out_free:
