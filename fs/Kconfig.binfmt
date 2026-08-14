@@ -96,6 +96,39 @@ config CORE_DUMP_DEFAULT_ELF_HEADERS
 	  This config option changes the default setting of coredump_filter
 	  seen at boot time.  If unsure, say Y.
 
+config BINFMT_PE
+	bool "Kernel support for PE/COFF (Windows) binaries"
+	depends on (X86_64 || COMPILE_TEST) && MMU
+	default n
+	help
+	  PE/COFF is the executable format used by Microsoft Windows.  Saying Y
+	  here teaches the kernel to recognise and load 64-bit (PE32+, AMD64)
+	  Windows executables directly, the same way BINFMT_ELF loads native
+	  Linux binaries: the image is mapped at its preferred base with the
+	  section protections the file requests, and control is transferred to
+	  the entry point.
+
+	  This is the loader half of the NT personality.  On its own it can run
+	  a freestanding native PE - one that makes system calls itself and
+	  imports nothing.  Running a real Windows program additionally needs
+	  the import resolver, the NT process environment block, and the NT
+	  system-call surface, which are built on top of this and are not
+	  required to load the image.
+
+	  The kernel builds and boots perfectly well without this option; say Y
+	  only if you want PE executable support.  If unsure, say N.
+
+config BINFMT_PE_KUNIT_TEST
+	bool "Build KUnit tests for PE binary support" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && BINFMT_PE=y
+	default KUNIT_ALL_TESTS
+	help
+	  This builds the PE loader KUnit tests, which exercise the PE/COFF
+	  header validation logic against hand-built valid and malformed
+	  headers.  This is only needed for debugging or regression testing.
+
+	  If unsure, say N.
+
 config BINFMT_SCRIPT
 	tristate "Kernel support for scripts starting with #!"
 	default y

@@ -413,6 +413,76 @@ Sample output::
     ntpath_resolve: process=explorer.exe type=drive-absolute volume=C \
         rel="Windows/System32" resolved=ffff888104a3c000 ino=131074 err=0
 
+Loading PE executables
+======================
+
+The filesystem personality answers NT's questions about files.  Running an
+NT *program* is a separate job, and it starts one layer down, at execve:
+the kernel has to recognise a Windows executable and lay it out in memory.
+``fs/binfmt_pe.c`` is that loader.  It is an ordinary ``binfmt`` handler,
+registered alongside ``binfmt_elf``, and it is built by ``CONFIG_BINFMT_PE``
+(``depends on X86_64``; the kernel builds and boots without it).
+
+What it does
+------------
+
+When execve is handed a file that begins with ``MZ`` and whose PE header
+describes a 64-bit AMD64 executable, ``binfmt_pe`` maps it the way the
+Windows loader would: the headers read-only at the image's preferred base,
+then each section at its virtual address with the protection the section
+asks for - ``.text`` executable, ``.data`` writable - with the
+uninitialised tail (``.bss`` and the zero-fill past a section's file data)
+provided as anonymous zero pages.  It records the image layout for
+``/proc`` and core dumps, puts the thread on a valid aligned stack, and
+transfers control to the entry point.  That is enough to run a freestanding
+native PE: one that makes its own system calls and imports nothing.
+
+The header validation is factored into a pure function,
+``pe_parse_headers()``, so that every "we only support ..." rule is in one
+place and can be unit tested without an execve.  Each rule refuses the
+image with ``-ENOEXEC`` rather than loading it wrongly, so a file this
+loader cannot handle correctly falls through to the next handler instead of
+crashing in a subtle way.
+
+What it does not do yet
+-----------------------
+
+The loader deliberately stops at "the image is in memory and running".
+A real Windows program needs more, and each piece is called out where the
+loader declines it:
+
+===============================  ===========================================
+Not yet done                     Consequence
+===============================  ===========================================
+Import resolution                a PE that calls into ``ntdll``/``kernel32``
+                                 has nothing to call; only self-contained
+                                 images run
+Base relocations                 an image that cannot get its preferred
+                                 address is refused, not relocated
+Sub-page file alignment          images built with the old 512-byte file
+                                 alignment are refused; the copy-in path is
+                                 future work (page alignment is mapped
+                                 directly from the file)
+PEB/TEB and process parameters   no process environment block, so the CRT
+                                 startup of a normal EXE has nowhere to read
+                                 its command line
+NT system-call surface           the entry point cannot make NT system
+                                 calls; the in-kernel NT file APIs
+                                 (``nt_create`` and friends) are not yet
+                                 wired to a syscall table
+===============================  ===========================================
+
+Where it fits
+-------------
+
+This is the bottom of the same stack the rest of this document describes.
+The filesystem personality gives an NT program the namespace it expects;
+``binfmt_pe`` gives it a way to start.  The missing middle - imports, the
+process environment block, and an NT system-call surface behind which the
+existing in-kernel NT file operations live - is what a userspace Win32
+stack (the Wine or ReactOS DLLs) would sit on top of.  Building the loader
+first means that surface has something concrete to plug into.
+
 Testing
 =======
 
@@ -421,10 +491,20 @@ and resolution::
 
     tools/testing/kunit/kunit.py run --kunitconfig fs/ntpers/tests
 
+KUnit for the PE loader's header validation (built into ``binfmt_pe.o`` via
+``CONFIG_BINFMT_PE_KUNIT_TEST``)::
+
+    tools/testing/kunit/kunit.py run --arch x86_64 binfmt_pe
+
 Selftests, covering the userspace-visible behaviour including real
 case-insensitive lookup against a live filesystem::
 
     make -C tools/testing/selftests TARGETS=filesystems/nt_personality run_tests
+
+An end-to-end selftest that builds a real PE on disk and execve()s it,
+checking that the loader ran it::
+
+    make -C tools/testing/selftests TARGETS=binfmt_pe run_tests
 
 Implementation status
 =====================
@@ -446,6 +526,8 @@ Stage                                          State
 5. Byte-range locks                           designed; not implemented
 6. System volume layout (C:\Windows, ...)     volume concept implemented
 7. Win32 subsystem hooks                      partial; see below
+8. PE loader (binfmt_pe)                       loads static native PE32+;
+                                              see "Loading PE executables"
 ============================================  =========================
 
 File metadata
