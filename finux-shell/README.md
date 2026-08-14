@@ -67,6 +67,17 @@ cmake --build build -j
 
 Run it under any EWMH-compliant window manager (openbox, xfwm, i3, …).
 
+**Install Selawik before judging how it looks:**
+
+```sh
+tools/install-selawik.sh
+```
+
+It is Microsoft's OFL-licensed, metric-compatible stand-in for Segoe UI, and
+the difference is not cosmetic — it runs 6–14% narrower than the DejaVu
+fallback at UI sizes, which changes every label width, every ellipsis cut and
+the measured width of the clock. See `docs/ASSETS.md`.
+
 ## Testing
 
 ```sh
@@ -112,8 +123,8 @@ is wrong.** Fix it there, not in the widget, so every consumer moves together.
 Two things this project legally cannot bundle:
 
 - **Segoe UI**, the Windows 10 shell font, is not redistributable. Install
-  [Selawik](https://github.com/microsoft/Selawik), Microsoft's own MIT-licensed
-  metric-compatible substitute, or supply Segoe UI from a machine you have
+  [Selawik](https://github.com/microsoft/Selawik), Microsoft's own metric-compatible
+  substitute, under the SIL Open Font License, or supply Segoe UI from a machine you have
   licensed. The shell warns and keeps running on any other font, but metrics
   will not match and pixdiff tests will fail — correctly.
 - **Icons** from `shell32.dll` / `imageres.dll` are copyrighted, as is the

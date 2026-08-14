@@ -1,7 +1,9 @@
 // Exercises the text stack end to end: resolve a face, shape a string,
 // rasterise it and composite it into a surface.
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "check.hpp"
 #include "gfx/image.hpp"
@@ -118,6 +120,47 @@ int main() {
       i += length;
     }
     if (finux::check::failures > 0) break;
+  }
+
+  // --- font resolution -----------------------------------------------------
+  //
+  // fontconfig always returns *something*, so a request for a missing family
+  // silently yields a substitute. The chain in FontLibrary only means anything
+  // because resolveFamilyFile() rejects a match whose family is not the one
+  // asked for -- without that guard, "Segoe UI" would resolve to DejaVu on
+  // every Linux box and the fallback list would never advance.
+  CHECK_MSG(library.open("No Such Family At All 12345", 12, options) == nullptr,
+            "a nonexistent family resolved to a substitute instead of failing");
+
+  // Whatever the chain produced must be one of the families it lists, never
+  // something fontconfig chose on its own.
+  const std::vector<std::string>& chain = text::FontLibrary::uiFontChain();
+  CHECK_MSG(std::find(chain.begin(), chain.end(), font->family()) != chain.end(),
+            "resolved family '" + font->family() + "' is not in the UI chain");
+  std::printf("note: UI font resolved to '%s' (%s)\n", font->family().c_str(),
+              font->file().c_str());
+
+  // Selawik exists to be metric-compatible with Segoe UI, so when it is
+  // installed it must be what the chain picks in the absence of Segoe UI --
+  // and it must be measurably narrower than the DejaVu backstop, which is the
+  // difference that makes every label lay out correctly.
+  if (std::shared_ptr<text::Font> selawik =
+          library.open("Selawik", 12, options)) {
+    if (std::shared_ptr<text::Font> dejavu =
+            library.open("DejaVu Sans", 12, options)) {
+      const int selawikWidth = renderer.measure(*selawik, "Type here to search");
+      const int dejavuWidth = renderer.measure(*dejavu, "Type here to search");
+      CHECK_MSG(selawikWidth < dejavuWidth,
+                "Selawik is not narrower than DejaVu (" +
+                    std::to_string(selawikWidth) + " vs " +
+                    std::to_string(dejavuWidth) + ")");
+    }
+    CHECK_MSG(font->family() == "Segoe UI" || font->family() == "Selawik",
+              "Selawik is installed but the chain chose '" + font->family() +
+                  "'");
+  } else {
+    std::printf("note: Selawik is not installed; text metrics will not match "
+                "Windows\n");
   }
 
   return finux::check::finish("text");

@@ -18,7 +18,7 @@ resolves a chain, in order:
 | Family | Notes |
 | --- | --- |
 | `Segoe UI` | Exact. Only present if you installed it from a machine you have licensed. |
-| `Selawik` | **The intended default.** Microsoft's own MIT-licensed, metric-compatible substitute, built for exactly this purpose. |
+| `Selawik` | **The intended default.** Microsoft's own metric-compatible substitute, under the SIL Open Font License 1.1. Built for exactly this purpose, and — unlike Segoe UI — redistributable. |
 | `DejaVu Sans` | Legibility backstop only. Metrically wrong; pixdiff tests are *expected* to fail against it. |
 
 The shell prints a warning when it falls back past Selawik. That warning is not
@@ -27,12 +27,39 @@ noise — it means fidelity results are meaningless until resolved.
 ### Installing Selawik
 
 ```sh
-# From https://github.com/microsoft/Selawik/releases
-mkdir -p ~/.local/share/fonts
-cp selawik*.ttf ~/.local/share/fonts/
+tools/install-selawik.sh        # ~/.local/share/fonts
+sudo tools/install-selawik.sh -s   # system-wide
+```
+
+Or by hand, from https://github.com/microsoft/Selawik/releases:
+
+```sh
+mkdir -p ~/.local/share/fonts/selawik
+cp selawk*.ttf ~/.local/share/fonts/selawik/
 fc-cache -f
 fc-match "Selawik"   # must report Selawik, not a substitute
 ```
+
+The archive carries five weights — Regular, Light, Semilight, Semibold and
+Bold — matching the Segoe UI family the Windows shell draws from.
+
+### Why the metrics matter
+
+Selawik is not merely "a similar-looking font". Measured at the shell's 12px
+UI size against the DejaVu Sans fallback:
+
+| String | Selawik | DejaVu | Difference |
+| --- | --- | --- | --- |
+| `Type here to search` | 98px | 108px | −9.3% |
+| `Untitled - Notepad` | 94px | 100px | −6.0% |
+| `Productivity` | 57px | 66px | −13.6% |
+| `4:44 PM` | 39px | 45px | −13.3% |
+
+Vertical metrics happen to coincide at this size (ascent 12, descent 3, line
+height 14), so the whole difference is horizontal — which is exactly what
+drives label truncation, the measured clock width, and whether a task button's
+title needs an ellipsis. Running against DejaVu does not make the shell look
+*slightly* off; it makes every width-derived layout decision wrong.
 
 `fc-match` matters: fontconfig always returns *something*, so a request for a
 missing family silently yields DejaVu. `FontLibrary::resolveFamilyFile()`
