@@ -441,6 +441,43 @@ int nt_ci_lookup(const struct path *dir, const char *name, size_t len,
 void nt_ci_invalidate_dir(struct inode *dir);
 void nt_ci_cache_stats(struct seq_file *m);
 
+/* --- create / open (fs/ntpers/open.c) -------------------------------- */
+
+/**
+ * struct nt_create_req - what a caller is asking nt_create() to do
+ * @disposition:  one of NT_DISPOSITION_*; decides create vs open vs truncate
+ * @options:      NT_CREATE_* flags
+ * @attributes:   NT_FILE_ATTRIBUTE_* to stamp on a file this call creates.
+ *                Ignored when an existing file is opened, exactly as
+ *                CreateFile ignores dwFlagsAndAttributes on an open.
+ * @resolve_flags: NT_RESOLVE_* passed through to path resolution; the
+ *                case-sensitivity of the lookup is a caller decision.
+ *
+ * Deliberately does not carry a desired-access or share-access field yet:
+ * nothing in this stage enforces them, and a request field that is
+ * recorded but not honoured is a promise with a caller attached.  They
+ * arrive with the stage that enforces them.
+ */
+struct nt_create_req {
+	u32	disposition;
+	u32	options;
+	u32	attributes;
+	u32	resolve_flags;
+};
+
+/**
+ * struct nt_open_result - what nt_create() did
+ * @path:   the resolved or newly created object; release with nt_path_put()
+ * @result: one of NT_RESULT_*, the IoStatusBlock.Information equivalent
+ */
+struct nt_open_result {
+	struct nt_path	path;
+	u32		result;
+};
+
+int nt_create(struct nt_task_ctx *ctx, const char *name,
+	      const struct nt_create_req *req, struct nt_open_result *out);
+
 /* --- file metadata (fs/ntpers/meta.c) -------------------------------- */
 
 int nt_query_file_info(const struct path *path, struct nt_volume *vol,

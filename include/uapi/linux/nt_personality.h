@@ -208,6 +208,42 @@ enum nt_path_type {
 
 /*
  * ---------------------------------------------------------------------
+ * Create / open  (layer: NT kernel - NtCreateFile / Win32 CreateFile)
+ * ---------------------------------------------------------------------
+ *
+ * Win32 CreateFile packs five behaviours into one call.  The one that
+ * decides whether a file is created, opened, or truncated is the
+ * "creation disposition"; these are the CreateFile dwCreationDisposition
+ * values, kept at their Win32 numbering so a personality shim can pass
+ * them straight through.
+ */
+#define NT_DISPOSITION_CREATE_NEW	1	/* create; fail if it exists */
+#define NT_DISPOSITION_CREATE_ALWAYS	2	/* create, or truncate if it exists */
+#define NT_DISPOSITION_OPEN_EXISTING	3	/* open; fail if it is absent */
+#define NT_DISPOSITION_OPEN_ALWAYS	4	/* open, or create if it is absent */
+#define NT_DISPOSITION_TRUNCATE_EXISTING 5	/* open and truncate; fail if absent */
+
+/*
+ * What actually happened, reported the way NtCreateFile reports it in its
+ * IoStatusBlock.Information field.  A caller uses this to tell CREATE_ALWAYS
+ * that made a new file from CREATE_ALWAYS that replaced one.
+ */
+#define NT_RESULT_CREATED		1	/* FILE_CREATED */
+#define NT_RESULT_OPENED		2	/* FILE_OPENED */
+#define NT_RESULT_OVERWRITTEN		3	/* FILE_OVERWRITTEN */
+
+/*
+ * Create options.  A subset of NtCreateFile's CreateOptions and the
+ * FILE_FLAG_* bits, limited to what changes name resolution or what is
+ * created rather than how bytes are later read.
+ */
+/* The object being created or opened must be a directory. */
+#define NT_CREATE_DIRECTORY		(1U << 0)
+/* Open a reparse point itself rather than following it (FILE_OPEN_REPARSE_POINT). */
+#define NT_CREATE_OPEN_REPARSE		(1U << 1)
+
+/*
+ * ---------------------------------------------------------------------
  * prctl() personality control
  * ---------------------------------------------------------------------
  * See include/uapi/linux/prctl.h for the PR_* numbers.
