@@ -103,7 +103,56 @@ struct nt_sd_relative {
 } __packed;
 
 #define NT_SD_REVISION		1
+#define NT_SE_DACL_PRESENT	0x0004
+#define NT_SE_SACL_PRESENT	0x0010
 #define NT_SE_SELF_RELATIVE	0x8000
+
+/*
+ * A SID, as it sits in a self-relative descriptor.  revision is always 1
+ * and the sub-authority count is at most 15 (SID_MAX_SUB_AUTHORITIES), so
+ * the whole thing is 8 + 4*count bytes.  Mirrors NT's struct SID.
+ */
+struct nt_sid {
+	u8	revision;
+	u8	sub_authority_count;
+	u8	identifier_authority[6];
+	__le32	sub_authority[];
+};
+
+#define NT_SID_REVISION		1
+#define NT_SID_MAX_SUB_AUTH	15
+
+/*
+ * An ACL header, followed by @ace_count ACEs packed into @acl_size bytes.
+ * revision is ACL_REVISION (2) or ACL_REVISION_DS (4).  Mirrors NT's
+ * struct ACL.
+ */
+struct nt_acl {
+	u8	revision;
+	u8	sbz1;
+	__le16	acl_size;
+	__le16	ace_count;
+	__le16	sbz2;
+};
+
+#define NT_ACL_REVISION		2
+#define NT_ACL_REVISION_DS	4
+
+/*
+ * The fixed part of an ACE.  The access-mask-plus-SID body below applies
+ * to the ACE types that carry a trustee - allowed, denied and audit.
+ */
+struct nt_ace_header {
+	u8	ace_type;
+	u8	ace_flags;
+	__le16	ace_size;
+};
+
+#define NT_ACE_ACCESS_ALLOWED	0x00
+#define NT_ACE_ACCESS_DENIED	0x01
+#define NT_ACE_SYSTEM_AUDIT	0x02
+/* Offset of the trustee SID within an allowed/denied/audit ACE. */
+#define NT_ACE_SID_OFFSET	(sizeof(struct nt_ace_header) + sizeof(__le32))
 
 static struct mnt_idmap *nt_idmap(const struct path *path)
 {
@@ -649,34 +698,142 @@ EXPORT_SYMBOL_GPL(nt_query_file_info);
  * back can rely on the header, and keeps a malformed descriptor from
  * being persisted where a future access check would trip over it.
  */
+/* Does a valid SID begin at @off and fit within @size bytes of @buf? */
+static bool nt_sid_valid(const void *buf, size_t size, u32 off)
+{
+	const struct nt_sid *sid;
+	u32 need;
+
+	if (off + sizeof(*sid) > size)
+		return false;
+	sid = buf + off;
+	if (sid->revision != NT_SID_REVISION)
+		return false;
+	if (sid->sub_authority_count > NT_SID_MAX_SUB_AUTH)
+		return false;
+
+	/* 8-byte fixed part plus one 32-bit word per sub-authority. */
+	need = sizeof(*sid) + (u32)sid->sub_authority_count * sizeof(__le32);
+	return off + need <= size;
+}
+
+/*
+ * Validate an ACL and every ACE in it.
+ *
+ * An ACL claims a byte length and an ACE count in its header; both are
+ * attacker-controlled once a descriptor can be set, so each ACE is walked
+ * and bounded rather than trusted.  A single ACE whose size runs past the
+ * ACL, or a trustee SID that runs past its ACE, fails the whole
+ * descriptor - a half-parsed ACL is exactly the kind of thing a future
+ * access check must never be handed.
+ */
+static bool nt_acl_valid(const void *buf, size_t size, u32 off)
+{
+	const struct nt_acl *acl;
+	u32 acl_size, pos, end;
+	unsigned int i, count;
+
+	if (off + sizeof(*acl) > size)
+		return false;
+	acl = buf + off;
+	if (acl->revision != NT_ACL_REVISION &&
+	    acl->revision != NT_ACL_REVISION_DS)
+		return false;
+
+	acl_size = le16_to_cpu(acl->acl_size);
+	if (acl_size < sizeof(*acl) || off + acl_size > size)
+		return false;
+
+	count = le16_to_cpu(acl->ace_count);
+	pos = off + sizeof(*acl);
+	end = off + acl_size;
+
+	for (i = 0; i < count; i++) {
+		const struct nt_ace_header *ace;
+		u32 ace_size;
+
+		if (pos + sizeof(*ace) > end)
+			return false;
+		ace = buf + pos;
+		ace_size = le16_to_cpu(ace->ace_size);
+		if (ace_size < sizeof(*ace) || pos + ace_size > end)
+			return false;
+
+		/* Types that carry a trustee: bound the mask and the SID. */
+		if (ace->ace_type == NT_ACE_ACCESS_ALLOWED ||
+		    ace->ace_type == NT_ACE_ACCESS_DENIED ||
+		    ace->ace_type == NT_ACE_SYSTEM_AUDIT) {
+			if (ace_size < NT_ACE_SID_OFFSET)
+				return false;
+			if (!nt_sid_valid(buf, pos + ace_size,
+					  pos + NT_ACE_SID_OFFSET))
+				return false;
+		}
+
+		pos += ace_size;
+	}
+
+	return true;
+}
+
+/*
+ * Deep-validate a self-relative security descriptor.
+ *
+ * The header check bounds the owner, group, DACL and SACL offsets; then
+ * each referenced structure is validated in full - the owner and group
+ * SIDs, and every ACE of each ACL that the control flags say is present.
+ * Nothing here consults the descriptor for an access decision; the point
+ * is that a stored descriptor is well formed, so that the access check
+ * added alongside it, and DACL enforcement later, are never handed a
+ * buffer that lies about its own shape.
+ */
 static bool nt_sd_is_valid(const void *buf, size_t size)
 {
 	const struct nt_sd_relative *sd = buf;
+	u16 control;
 	u32 off;
 
 	if (size < sizeof(*sd) || size > NT_SD_MAX_SIZE)
 		return false;
 	if (sd->revision != NT_SD_REVISION)
 		return false;
-	if (!(le16_to_cpu(sd->control) & NT_SE_SELF_RELATIVE))
+	control = le16_to_cpu(sd->control);
+	if (!(control & NT_SE_SELF_RELATIVE))
 		return false;
 
-	/*
-	 * Every offset is either zero, meaning absent, or must land inside
-	 * the buffer with room for at least a minimal structure.
-	 */
 	off = le32_to_cpu(sd->owner);
-	if (off && (off < sizeof(*sd) || off >= size))
-		return false;
+	if (off) {
+		if (off < sizeof(*sd) || !nt_sid_valid(buf, size, off))
+			return false;
+	}
 	off = le32_to_cpu(sd->group);
-	if (off && (off < sizeof(*sd) || off >= size))
-		return false;
+	if (off) {
+		if (off < sizeof(*sd) || !nt_sid_valid(buf, size, off))
+			return false;
+	}
+
+	/*
+	 * A non-zero ACL offset must land inside the buffer whether or not
+	 * its present flag is set - a bogus offset is malformed either way.
+	 * The deep walk of the ACL's ACEs only runs when the control flag
+	 * says the ACL is actually present.
+	 */
 	off = le32_to_cpu(sd->dacl);
-	if (off && (off < sizeof(*sd) || off >= size))
-		return false;
+	if (off) {
+		if (off < sizeof(*sd) || off >= size)
+			return false;
+		if ((control & NT_SE_DACL_PRESENT) &&
+		    !nt_acl_valid(buf, size, off))
+			return false;
+	}
 	off = le32_to_cpu(sd->sacl);
-	if (off && (off < sizeof(*sd) || off >= size))
-		return false;
+	if (off) {
+		if (off < sizeof(*sd) || off >= size)
+			return false;
+		if ((control & NT_SE_SACL_PRESENT) &&
+		    !nt_acl_valid(buf, size, off))
+			return false;
+	}
 
 	return true;
 }

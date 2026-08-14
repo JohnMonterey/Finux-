@@ -263,6 +263,45 @@ static int nt_resolve_or_create(struct nt_task_ctx *ctx,
 	return 0;
 }
 
+/*
+ * Check that the caller may take the access it is asking for.
+ *
+ * This is the point where, once an NT access token exists to match SIDs
+ * against, DACL evaluation will plug in.  Until then the stored security
+ * descriptor does not govern access - the design document says so plainly
+ * - and the enforcement is POSIX: the desired NT access is reduced to
+ * MAY_READ / MAY_WRITE and checked against the inode the ordinary Linux
+ * way.  That is honest about what protects the file today (uid, gid,
+ * mode, POSIX ACLs) while giving the open a real access gate rather than
+ * granting every handle unconditionally.
+ *
+ * Deliberately narrow: only read and write are mapped.  A Windows data
+ * open uses GENERIC_READ or GENERIC_WRITE; mapping FILE_EXECUTE onto the
+ * POSIX execute bit would wrongly refuse an ordinary read of a file that
+ * merely lacks +x.  Delete access is not gated here - it is enforced by
+ * the share check (FILE_SHARE_DELETE) and, at the actual unlink, by the
+ * VFS permission check on the parent directory.
+ */
+static int nt_check_access(const struct path *path, u32 access)
+{
+	int mask = 0;
+
+	if (access & NT_ACCESS_GENERIC_ALL)
+		access |= NT_ACCESS_GENERIC_READ | NT_ACCESS_GENERIC_WRITE;
+
+	if (access & (NT_ACCESS_GENERIC_READ | NT_ACCESS_FILE_READ_DATA))
+		mask |= MAY_READ;
+	if (access & (NT_ACCESS_GENERIC_WRITE | NT_ACCESS_FILE_WRITE_DATA |
+		      NT_ACCESS_FILE_APPEND_DATA))
+		mask |= MAY_WRITE;
+
+	if (!mask)
+		return 0;
+
+	return inode_permission(mnt_idmap(path->mnt), d_inode(path->dentry),
+				mask);
+}
+
 /* Unlink (or rmdir) the object a delete-on-close handle held. */
 static void nt_unlink_handle(struct nt_open *open)
 {
@@ -387,6 +426,18 @@ int nt_create(struct nt_task_ctx *ctx, const char *name,
 					   &final, &result, &needs_trunc);
 		if (err)
 			goto out_free;
+	}
+
+	/*
+	 * The access gate, before the share check, so an open that the
+	 * caller has no permission for fails with -EACCES rather than
+	 * -EBUSY.  A file this call just created is owned by the caller and
+	 * passes; an existing file enforces its mode.
+	 */
+	err = nt_check_access(&final.path, req->access);
+	if (err) {
+		nt_path_put(&final);
+		goto out_free;
 	}
 
 	/* Build the handle around the resolved-or-created object. */

@@ -656,6 +656,132 @@ static void test_security_descriptor_roundtrip(struct kunit *test)
  * Storing a malformed descriptor must be refused, so that anything
  * reading one back can trust the header.
  */
+/*
+ * Build a fully-formed self-relative descriptor: a header, an owner SID,
+ * and a DACL of one ACCESS_ALLOWED ACE carrying a trustee SID.  Returns
+ * the length used.  The layout is spelled out so a test can corrupt one
+ * field at a time and know exactly what it broke.
+ *
+ *   0  header (20 bytes): rev, sbz, control, owner/group/sacl/dacl offsets
+ *   20 owner SID (12 bytes): rev=1, 1 sub-authority
+ *   32 DACL: ACL header (8) + one ACE (20) = 28 bytes
+ *   40   ACE: header(4) + access mask(4) + trustee SID(12)
+ */
+static size_t nt_build_full_sd(u8 *buf)
+{
+	memset(buf, 0, 64);
+
+	/* Header. */
+	buf[0] = 1;			/* revision */
+	buf[2] = 0x04;			/* control: SE_DACL_PRESENT ... */
+	buf[3] = 0x80;			/* ... | SE_SELF_RELATIVE */
+	buf[4] = 20;			/* owner offset */
+	buf[16] = 32;			/* dacl offset */
+
+	/* Owner SID at 20: revision 1, one sub-authority (NT AUTHORITY\...). */
+	buf[20] = 1;			/* SID revision */
+	buf[21] = 1;			/* sub-authority count */
+	buf[27] = 5;			/* identifier authority = 5 */
+	buf[28] = 18;			/* sub-authority[0] = 18 */
+
+	/* DACL header at 32: revision 2, size 28, one ACE. */
+	buf[32] = 2;			/* ACL revision */
+	buf[34] = 28;			/* acl_size low byte */
+	buf[36] = 1;			/* ace_count low byte */
+
+	/* ACE at 40: ACCESS_ALLOWED, size 20. */
+	buf[40] = 0x00;			/* ACCESS_ALLOWED_ACE_TYPE */
+	buf[42] = 20;			/* ace_size low byte */
+	buf[44] = 0x01;			/* access mask (FILE_READ_DATA) */
+
+	/* Trustee SID at 48: revision 1, one sub-authority. */
+	buf[48] = 1;
+	buf[49] = 1;
+	buf[55] = 5;
+	buf[56] = 32;			/* BUILTIN */
+
+	return 60;
+}
+
+/* A fully-formed descriptor - owner SID, DACL, one ACE - round-trips. */
+static void test_sd_deep_validation_accepts(struct kunit *test)
+{
+	struct dentry *file;
+	struct path path;
+	u8 sd[64], back[64];
+	ssize_t got;
+	int err;
+
+	file = nt_meta_create(test, "GoodSd.txt", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+
+	nt_build_full_sd(sd);
+	err = nt_set_security_descriptor(&path, sd, 64);
+	if (err == -EOPNOTSUPP || err == -EPERM || err == -EACCES)
+		kunit_skip(test, "backing filesystem rejects security.* (%d)",
+			   err);
+	KUNIT_ASSERT_EQ_MSG(test, err, 0,
+			    "a well-formed descriptor must be accepted");
+
+	got = nt_get_security_descriptor(&path, back, sizeof(back));
+	KUNIT_ASSERT_EQ(test, got, 64);
+	KUNIT_EXPECT_EQ(test, memcmp(sd, back, 64), 0);
+}
+
+/*
+ * Deep validation rejects a descriptor that lies about the shape of the
+ * structures it points at: an over-long SID, a truncated one, and an ACL
+ * whose ACEs or count do not fit.  A future access check must never be
+ * handed one of these.
+ */
+static void test_sd_deep_validation_rejects(struct kunit *test)
+{
+	struct dentry *file;
+	struct path path;
+	u8 sd[64];
+
+	file = nt_meta_create(test, "DeepBad.txt", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+
+	/* Owner SID claiming more sub-authorities than are allowed. */
+	nt_build_full_sd(sd);
+	sd[21] = 16;			/* > SID_MAX_SUB_AUTHORITIES */
+	KUNIT_EXPECT_EQ_MSG(test, nt_set_security_descriptor(&path, sd, 64),
+			    -EINVAL, "sub-authority count over 15");
+
+	/* Owner offset so near the end the SID cannot fit. */
+	nt_build_full_sd(sd);
+	sd[4] = 60;			/* owner at 60, no room for 8+ bytes */
+	KUNIT_EXPECT_EQ_MSG(test, nt_set_security_descriptor(&path, sd, 64),
+			    -EINVAL, "truncated owner SID");
+
+	/* An ACE whose size runs past the end of the ACL. */
+	nt_build_full_sd(sd);
+	sd[42] = 40;			/* ace_size 40, ACL only has 28 */
+	KUNIT_EXPECT_EQ_MSG(test, nt_set_security_descriptor(&path, sd, 64),
+			    -EINVAL, "ACE overruns its ACL");
+
+	/* An ACE count claiming more ACEs than the ACL holds. */
+	nt_build_full_sd(sd);
+	sd[36] = 5;			/* says 5 ACEs; only one fits */
+	KUNIT_EXPECT_EQ_MSG(test, nt_set_security_descriptor(&path, sd, 64),
+			    -EINVAL, "ace_count larger than the ACL");
+
+	/* An ACL whose declared size runs past the buffer. */
+	nt_build_full_sd(sd);
+	sd[34] = 200;
+	KUNIT_EXPECT_EQ_MSG(test, nt_set_security_descriptor(&path, sd, 64),
+			    -EINVAL, "acl_size past the buffer");
+
+	/* A trustee SID inside the ACE claiming too many sub-authorities. */
+	nt_build_full_sd(sd);
+	sd[49] = 16;
+	KUNIT_EXPECT_EQ_MSG(test, nt_set_security_descriptor(&path, sd, 64),
+			    -EINVAL, "over-long trustee SID in an ACE");
+}
+
 static void test_security_descriptor_validation(struct kunit *test)
 {
 	struct dentry *file;
@@ -723,6 +849,8 @@ static struct kunit_case nt_meta_test_cases[] = {
 	KUNIT_CASE(test_query_file_info),
 	KUNIT_CASE(test_security_descriptor_roundtrip),
 	KUNIT_CASE(test_security_descriptor_validation),
+	KUNIT_CASE(test_sd_deep_validation_accepts),
+	KUNIT_CASE(test_sd_deep_validation_rejects),
 	{}
 };
 

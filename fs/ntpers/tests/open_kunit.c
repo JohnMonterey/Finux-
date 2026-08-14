@@ -12,6 +12,8 @@
  * case - the property this whole layer exists to add.
  */
 
+#include <linux/capability.h>
+#include <linux/cred.h>
 #include <linux/nt_personality.h>
 
 #include "ntpers_kunit.h"
@@ -530,6 +532,73 @@ static void nt_op_delete_on_close_waits_for_last(struct kunit *test)
 			      NT_DISPOSITION_OPEN_EXISTING, 0, &check), -ENOENT);
 }
 
+/* ------------------------------------------------------- access check */
+
+/*
+ * The desired access is gated against the file's mode.  A write open of a
+ * read-only file is refused; a read open of a world-readable one is not.
+ *
+ * KUnit runs as root, which bypasses DAC, so the check is exercised from
+ * an unprivileged credential - the same technique the case-fold read
+ * permission test uses.
+ */
+static void nt_op_access_check_enforces_mode(struct kunit *test)
+{
+	struct nt_open_result out;
+	const struct cred *old_cred;
+	struct cred *unpriv;
+	struct iattr attr = { .ia_valid = ATTR_MODE };
+	struct dentry *file;
+	int err;
+
+	/* Create as root, then make it read-only for everyone. */
+	KUNIT_ASSERT_EQ(test,
+			nt_op(test, "C:\\ReadOnly.txt",
+			      NT_DISPOSITION_CREATE_NEW, 0, &out), 0);
+	file = dget(out.handle->path.dentry);
+	attr.ia_mode = (d_inode(file)->i_mode & ~0777) | 0444;
+	inode_lock(d_inode(file));
+	err = notify_change(&nop_mnt_idmap, file, &attr, NULL);
+	inode_unlock(d_inode(file));
+	nt_close(out.handle);
+	if (err) {
+		dput(file);
+		kunit_skip(test, "could not drop write permission (%d)", err);
+	}
+
+	unpriv = prepare_creds();
+	if (!unpriv) {
+		dput(file);
+		kunit_skip(test, "could not prepare credentials");
+	}
+	cap_clear(unpriv->cap_effective);
+	cap_clear(unpriv->cap_permitted);
+	cap_clear(unpriv->cap_bset);
+	unpriv->fsuid = make_kuid(unpriv->user_ns, 65534);
+	unpriv->fsgid = make_kgid(unpriv->user_ns, 65534);
+	old_cred = override_creds(unpriv);
+
+	/* Write access to a read-only file is refused before sharing. */
+	err = nt_op_share(test, "C:\\ReadOnly.txt", NT_DISPOSITION_OPEN_EXISTING,
+			  NT_ACCESS_GENERIC_WRITE, NT_OP_ALL_SHARE, 0, &out);
+	KUNIT_EXPECT_EQ_MSG(test, err, -EACCES,
+			    "write open of a read-only file must be refused");
+	if (!err)
+		nt_close(out.handle);
+
+	/* Read access to a world-readable file is granted. */
+	err = nt_op_share(test, "C:\\ReadOnly.txt", NT_DISPOSITION_OPEN_EXISTING,
+			  NT_ACCESS_GENERIC_READ, NT_OP_ALL_SHARE, 0, &out);
+	KUNIT_EXPECT_EQ_MSG(test, err, 0,
+			    "read open of a readable file is allowed");
+	if (!err)
+		nt_close(out.handle);
+
+	revert_creds(old_cred);
+	put_cred(unpriv);
+	dput(file);
+}
+
 static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_create_new_absent),
 	KUNIT_CASE(nt_op_open_existing_absent),
@@ -552,6 +621,7 @@ static struct kunit_case nt_open_test_cases[] = {
 	KUNIT_CASE(nt_op_delete_on_close_removes_file),
 	KUNIT_CASE(nt_op_delete_pending_blocks_open),
 	KUNIT_CASE(nt_op_delete_on_close_waits_for_last),
+	KUNIT_CASE(nt_op_access_check_enforces_mode),
 	{}
 };
 

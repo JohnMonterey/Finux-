@@ -436,9 +436,12 @@ Stage                                          State
 2. NT/Win32 pathname parser and resolver      implemented
 2. Case-insensitive resolution                implemented (both tiers)
 3. DOS attributes, NT timestamps, file IDs    implemented
-3. NT security descriptor storage             implemented (advisory)
+3. NT security descriptor storage + validation implemented; access
+                                              gated by POSIX (see below)
+4. Create/open, dispositions, collisions      implemented
+4. Share modes, delete-on-close, delete-pending implemented
 4. Alternate streams, reparse points, 8.3     parsed only; not stored
-5. Share modes, delete-pending, range locks   designed; not implemented
+5. Byte-range locks                           designed; not implemented
 6. System volume layout (C:\Windows, ...)     volume concept implemented
 7. Win32 subsystem hooks                      partial; see below
 ============================================  =========================
@@ -612,15 +615,49 @@ is not sufficient.  A symlink is a valid optimised backing for
 ``IO_REPARSE_TAG_SYMLINK``, but the tag and payload must stay visible to
 the NT personality.
 
-Handle semantics (stage 5)
---------------------------
+Create, open and handle semantics
+---------------------------------
 
-Windows share modes are a property of open handles, so they belong above
-individual filesystems: a VFS-level sharing state keyed to the inode,
-checked at open, holding desired access and share mode, and implementing
-delete-pending.  POSIX ``unlink`` semantics are not equivalent and must
-not be assumed to be.  Byte-range locking should reuse ``fs/locks.c``
-rather than reinventing it.
+``nt_create()`` (fs/ntpers/open.c) is the NtCreateFile of this subsystem.
+It applies the creation disposition, checks access, checks sharing, and
+returns a handle - ``struct nt_open`` - rather than a bare path.  The
+order matters: a name is resolved case-insensitively before any create,
+so two files differing only in case can never both be made; and the share
+check runs before any truncation, so a ``CREATE_ALWAYS`` refused on
+sharing grounds does not first destroy the contents it could not replace.
+
+Windows share modes are a property of open handles, not of names, so the
+sharing state (fs/ntpers/share.c) is keyed to the inode: a hard link or a
+differently cased path to the same file shares one view.  Each inode with
+an NT handle open carries the running totals the NT algorithm
+(``IoCheckShareAccess``) needs, and an open that wants access an existing
+handle will not share, or that will not share access an existing handle
+holds, fails with a sharing violation.  ``FILE_DELETE_ON_CLOSE`` marks the
+file to be unlinked on the last close; while such a handle is open the
+delete is pending and other opens are refused, as on Windows.  POSIX
+``unlink`` semantics are *not* equivalent to this and are not assumed to
+be.  Byte-range locking should reuse ``fs/locks.c`` rather than
+reinventing it.
+
+Security descriptors and access
+-------------------------------
+
+A stored security descriptor is deeply validated before it is written
+(fs/ntpers/meta.c): the header offsets are bounded, the owner and group
+SIDs are checked for revision and sub-authority count, and every ACE of a
+present DACL or SACL is walked and bounded so that no ACE overruns its ACL
+and no trustee SID overruns its ACE.  A malformed descriptor is refused
+rather than persisted, so nothing that later reads one back - or evaluates
+it - is handed a buffer that lies about its own shape.
+
+The descriptor does **not** yet govern access: there is no NT access token
+to evaluate a DACL against.  ``nt_create()`` gates the requested access
+through an ordinary POSIX permission check on the inode - a write open of
+a file the caller cannot write is refused - and that check is the point
+where DACL evaluation will plug in once a token model exists.  Until then
+the honest statement is that uid, gid, mode and POSIX ACLs are what
+protect a file, and the NT descriptor is well-formed metadata riding
+alongside.
 
 Things this subsystem deliberately does not do
 ==============================================
