@@ -1,0 +1,8 @@
+build/
+out/
+.cache/
+compile_commands.json
+tests/pixdiff/output/
+*.o
+*.so
+*.a

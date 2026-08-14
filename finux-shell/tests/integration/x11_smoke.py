@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""End-to-end check of the X11 backend against a real window manager.
+
+Everything else in the suite renders offscreen. That covers the widget and
+text stacks, but it cannot see the two things that make the bar a shell
+component rather than a picture of one:
+
+  * whether the window manager honours _NET_WM_STRUT_PARTIAL, and
+  * whether the bar ends up where we asked it to.
+
+Both have already failed in practice. openbox silently relocated the bar to
+the top of the screen while still reserving space at the bottom, because the
+window carried no WM_NORMAL_HINTS -- a mismatch no offscreen test can detect.
+
+Exits 77 (CTest's "skipped") when Xvfb, openbox or xwd are unavailable.
+"""
+
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+SKIP = 77
+BAR_HEIGHT = 40
+SCREEN_W, SCREEN_H = 1280, 800
+
+TASKBAR_BG = (31, 31, 31)
+ACCENT = (0, 120, 215)
+ICON_TILE = (0, 90, 158)
+
+
+def skip(reason):
+    print(f"SKIP x11_smoke: {reason}")
+    sys.exit(SKIP)
+
+
+class Xwd:
+    """Minimal XWD reader; avoids an ImageMagick dependency just to peek."""
+
+    def __init__(self, blob):
+        head = struct.unpack(">25I", blob[:100])
+        self.header_size = head[0]
+        self.width, self.height = head[4], head[5]
+        self.bpp, self.bytes_per_line = head[11], head[12]
+        ncolors = head[19]
+        self.offset = self.header_size + ncolors * 12
+        self.blob = blob
+
+    def pixel(self, x, y):
+        o = self.offset + y * self.bytes_per_line + x * (self.bpp // 8)
+        return (self.blob[o + 2], self.blob[o + 1], self.blob[o])
+
+    def runs_of(self, color, y):
+        """Contiguous x-ranges on row `y` matching `color`."""
+        runs, start = [], None
+        for x in range(self.width):
+            if self.pixel(x, y) == color:
+                if start is None:
+                    start = x
+            elif start is not None:
+                runs.append((start, x - 1))
+                start = None
+        if start is not None:
+            runs.append((start, self.width - 1))
+        return runs
+
+    def count_not(self, color, x0, x1, y0, y1):
+        return sum(
+            1
+            for y in range(y0, y1)
+            for x in range(x0, x1)
+            if self.pixel(x, y) != color
+        )
+
+
+class Session:
+    def __init__(self):
+        self.procs = []
+        self.display = None
+
+    def spawn(self, argv, **kwargs):
+        env = dict(os.environ)
+        if self.display:
+            env["DISPLAY"] = self.display
+        proc = subprocess.Popen(
+            argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **kwargs
+        )
+        self.procs.append(proc)
+        return proc
+
+    def run(self, argv, timeout=10):
+        env = dict(os.environ)
+        if self.display:
+            env["DISPLAY"] = self.display
+        return subprocess.run(argv, env=env, capture_output=True,
+                              timeout=timeout)
+
+    def wait_for(self, predicate, what, timeout=15.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.1)
+        raise TimeoutError(f"timed out waiting for {what}")
+
+    def close(self):
+        for proc in reversed(self.procs):
+            proc.terminate()
+        for proc in reversed(self.procs):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("usage: x11_smoke.py <finux-shell> <finux-testwindow>",
+              file=sys.stderr)
+        return 2
+    shell_bin, testwindow_bin = sys.argv[1], sys.argv[2]
+
+    for tool in ("Xvfb", "openbox", "xwd", "xprop", "xwininfo"):
+        if not shutil.which(tool):
+            skip(f"{tool} is not installed")
+    for path in (shell_bin, testwindow_bin):
+        if not os.path.exists(path):
+            skip(f"{path} was not built")
+
+    session = Session()
+    failures = []
+
+    def check(ok, message):
+        if not ok:
+            failures.append(message)
+            print(f"FAIL {message}")
+        else:
+            print(f"  ok: {message}")
+
+    try:
+        # --- display ---------------------------------------------------------
+        for number in range(99, 120):
+            display = f":{number}"
+            proc = subprocess.Popen(
+                ["Xvfb", display, "-screen", "0",
+                 f"{SCREEN_W}x{SCREEN_H}x24"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            session.procs.append(proc)
+            session.display = display
+            time.sleep(0.3)
+            if proc.poll() is None and session.run(["xdpyinfo"]).returncode == 0:
+                break
+            session.display = None
+        if not session.display:
+            skip("could not start Xvfb on any display")
+
+        session.wait_for(
+            lambda: session.run(["xdpyinfo"]).returncode == 0, "the X server")
+
+        # --- window manager --------------------------------------------------
+        session.spawn(["openbox"])
+        session.wait_for(
+            lambda: b"_NET_SUPPORTED" in session.run(
+                ["xprop", "-root", "_NET_SUPPORTED"]).stdout,
+            "openbox to claim the screen")
+
+        # --- client windows --------------------------------------------------
+        session.spawn([testwindow_bin, "Untitled - Notepad", "Notepad"])
+        session.spawn([testwindow_bin, "Documents", "Explorer"])
+        session.wait_for(
+            lambda: session.run(
+                ["xprop", "-root", "_NET_CLIENT_LIST"]
+            ).stdout.count(b"0x") >= 2,
+            "two client windows")
+
+        # --- the shell -------------------------------------------------------
+        session.spawn([shell_bin])
+        session.wait_for(
+            lambda: session.run(
+                ["xwininfo", "-name", "finux-shell"]).returncode == 0,
+            "the taskbar window")
+        # Let the shell observe the client list and paint.
+        time.sleep(2.0)
+
+        # --- geometry --------------------------------------------------------
+        info = session.run(["xwininfo", "-name", "finux-shell"]).stdout.decode()
+        geometry = {}
+        for line in info.splitlines():
+            if "Absolute upper-left Y:" in line:
+                geometry["y"] = int(line.split(":")[1])
+            elif line.strip().startswith("Width:"):
+                geometry["w"] = int(line.split(":")[1])
+            elif line.strip().startswith("Height:"):
+                geometry["h"] = int(line.split(":")[1])
+
+        check(geometry.get("h") == BAR_HEIGHT,
+              f"bar is {BAR_HEIGHT}px tall (got {geometry.get('h')})")
+        check(geometry.get("w") == SCREEN_W,
+              f"bar spans the screen (got {geometry.get('w')})")
+        # The regression that motivated this test: strut on one edge, bar on
+        # the other.
+        check(geometry.get("y") == SCREEN_H - BAR_HEIGHT,
+              f"bar sits on the bottom edge at y={SCREEN_H - BAR_HEIGHT} "
+              f"(got {geometry.get('y')})")
+
+        # --- strut -----------------------------------------------------------
+        workarea = session.run(["xprop", "-root", "_NET_WORKAREA"]).stdout.decode()
+        numbers = [int(n) for n in workarea.replace("=", ",").split(",")
+                   if n.strip().lstrip("-").isdigit()]
+        check(bool(numbers) and numbers[3] == SCREEN_H - BAR_HEIGHT,
+              f"window manager reserved {BAR_HEIGHT}px "
+              f"(_NET_WORKAREA height {numbers[3] if numbers else 'unset'})")
+
+        # --- pixels ----------------------------------------------------------
+        capture = session.run(["xwd", "-root", "-silent"]).stdout
+        check(len(capture) > 1000, "captured the root window")
+        if len(capture) > 1000:
+            image = Xwd(capture)
+            top = image.height - BAR_HEIGHT
+
+            check(image.pixel(900, top + 4) == TASKBAR_BG,
+                  "taskbar background reached the screen")
+
+            start_ink = image.count_not(TASKBAR_BG, 0, 48, top, image.height)
+            check(start_ink > 0, f"start button drew ({start_ink} px)")
+
+            runs = image.runs_of(ACCENT, image.height - 2)
+            check(len(runs) == 2,
+                  f"one running indicator per client window (got {len(runs)}, "
+                  f"want 2)")
+            for index, (x0, x1) in enumerate(runs):
+                check(image.pixel(x0 + 2, top + 20) == ICON_TILE,
+                      f"task button {index} drew its icon tile")
+
+            clock_ink = image.count_not(TASKBAR_BG, 1195, image.width - 8, top,
+                                        image.height)
+            check(clock_ink > 0, f"clock drew ({clock_ink} px)")
+
+            # The bar must not list itself, so the count above already proves
+            # the dock window was filtered out of _NET_CLIENT_LIST.
+            clients = session.run(
+                ["xprop", "-root", "_NET_CLIENT_LIST"]).stdout.count(b"0x")
+            check(clients >= 3,
+                  f"the dock is in the client list ({clients}) yet was not "
+                  f"given a task button")
+    except TimeoutError as error:
+        print(f"FAIL {error}")
+        failures.append(str(error))
+    finally:
+        session.close()
+
+    if failures:
+        print(f"FAILED x11_smoke ({len(failures)} check"
+              f"{'' if len(failures) == 1 else 's'})")
+        return 1
+    print("PASS x11_smoke")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
