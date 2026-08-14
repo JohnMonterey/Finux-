@@ -830,6 +830,147 @@ static void test_security_descriptor_validation(struct kunit *test)
 			-EINVAL);
 }
 
+/*
+ * Build a REPARSE_DATA_BUFFER: tag, data_length, reserved, then (for a
+ * non-Microsoft tag) a 16-byte GUID, then @payload bytes.  Returns the
+ * total length.
+ */
+static size_t nt_build_reparse(u8 *buf, u32 tag, size_t payload)
+{
+	bool ms = tag & 0x80000000u;
+	size_t fixed = ms ? 8 : 24;
+
+	memset(buf, 0, fixed + payload);
+	buf[0] = tag & 0xff;
+	buf[1] = (tag >> 8) & 0xff;
+	buf[2] = (tag >> 16) & 0xff;
+	buf[3] = (tag >> 24) & 0xff;
+	buf[4] = payload & 0xff;
+	buf[5] = (payload >> 8) & 0xff;
+	memset(buf + fixed, 0xAB, payload);
+	return fixed + payload;
+}
+
+/* A reparse point set on a file round-trips and shows up in the query. */
+static void test_reparse_roundtrip(struct kunit *test)
+{
+	struct nt_file_info info;
+	struct dentry *file;
+	struct path path;
+	u8 rp[64], back[64];
+	size_t len;
+	ssize_t got;
+	int err;
+
+	file = nt_meta_create(test, "Junction", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+
+	/* No reparse point to begin with. */
+	KUNIT_ASSERT_EQ(test, nt_query_file_info(&path, NULL, &info), 0);
+	KUNIT_EXPECT_FALSE(test,
+			   info.attributes & NT_FILE_ATTRIBUTE_REPARSE_POINT);
+
+	len = nt_build_reparse(rp, NT_IO_REPARSE_TAG_MOUNT_POINT, 12);
+	err = nt_set_reparse_point(&path, rp, len);
+	if (err == -EOPNOTSUPP || err == -EPERM || err == -EACCES)
+		kunit_skip(test, "backing filesystem rejects user.* (%d)", err);
+	KUNIT_ASSERT_EQ(test, err, 0);
+
+	/* Read back verbatim. */
+	got = nt_get_reparse_point(&path, back, sizeof(back));
+	KUNIT_ASSERT_EQ(test, got, (ssize_t)len);
+	KUNIT_EXPECT_EQ(test, memcmp(rp, back, len), 0);
+
+	/* The query now reports the point and its tag. */
+	KUNIT_ASSERT_EQ(test, nt_query_file_info(&path, NULL, &info), 0);
+	KUNIT_EXPECT_TRUE(test,
+			  info.attributes & NT_FILE_ATTRIBUTE_REPARSE_POINT);
+	KUNIT_EXPECT_EQ(test, info.reparse_tag,
+			(u32)NT_IO_REPARSE_TAG_MOUNT_POINT);
+
+	/* Deleting it makes the file ordinary again. */
+	KUNIT_ASSERT_EQ(test, nt_delete_reparse_point(&path), 0);
+	KUNIT_ASSERT_EQ(test, nt_query_file_info(&path, NULL, &info), 0);
+	KUNIT_EXPECT_FALSE(test,
+			   info.attributes & NT_FILE_ATTRIBUTE_REPARSE_POINT);
+	KUNIT_EXPECT_EQ(test, nt_get_reparse_point(&path, back, sizeof(back)),
+			-ENODATA);
+}
+
+/* A malformed reparse buffer is refused. */
+static void test_reparse_validation(struct kunit *test)
+{
+	struct dentry *file;
+	struct path path;
+	u8 rp[64];
+	size_t len;
+	int err;
+
+	file = nt_meta_create(test, "BadRp", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+
+	/* Confirm the backing store takes reparse xattrs at all. */
+	len = nt_build_reparse(rp, NT_IO_REPARSE_TAG_MOUNT_POINT, 4);
+	err = nt_set_reparse_point(&path, rp, len);
+	if (err == -EOPNOTSUPP || err == -EPERM || err == -EACCES)
+		kunit_skip(test, "backing filesystem rejects user.* (%d)", err);
+	KUNIT_ASSERT_EQ(test, err, 0);
+	KUNIT_ASSERT_EQ(test, nt_delete_reparse_point(&path), 0);
+
+	/* Shorter than a header. */
+	KUNIT_EXPECT_EQ(test, nt_set_reparse_point(&path, rp, 4), -EINVAL);
+
+	/* Tag zero is reserved and cannot be set. */
+	len = nt_build_reparse(rp, NT_IO_REPARSE_TAG_MOUNT_POINT, 8);
+	memset(rp, 0, 4);
+	KUNIT_EXPECT_EQ(test, nt_set_reparse_point(&path, rp, len), -EINVAL);
+
+	/* data_length that disagrees with the buffer length. */
+	len = nt_build_reparse(rp, NT_IO_REPARSE_TAG_MOUNT_POINT, 8);
+	rp[4] = 99;			/* claims 99 payload bytes */
+	KUNIT_EXPECT_EQ(test, nt_set_reparse_point(&path, rp, len), -EINVAL);
+
+	/* A non-Microsoft tag without room for its GUID. */
+	len = nt_build_reparse(rp, NT_IO_REPARSE_TAG_MOUNT_POINT, 8);
+	rp[3] = 0x00;			/* clear the high bit: now non-MS */
+	KUNIT_EXPECT_EQ(test, nt_set_reparse_point(&path, rp, len), -EINVAL);
+}
+
+/* A third-party (non-Microsoft) reparse point carries a GUID and works. */
+static void test_reparse_non_microsoft(struct kunit *test)
+{
+	struct nt_file_info info;
+	struct dentry *file;
+	struct path path;
+	u8 rp[64], back[64];
+	size_t len;
+	int err;
+
+	file = nt_meta_create(test, "ThirdParty", false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(file));
+	nt_meta_path(test, file, &path);
+
+	/* Tag 0x00001234: high bit clear, so the 24-byte GUID header form. */
+	len = nt_build_reparse(rp, 0x00001234, 8);
+	KUNIT_ASSERT_EQ(test, len, (size_t)32);
+
+	err = nt_set_reparse_point(&path, rp, len);
+	if (err == -EOPNOTSUPP || err == -EPERM || err == -EACCES)
+		kunit_skip(test, "backing filesystem rejects user.* (%d)", err);
+	KUNIT_ASSERT_EQ(test, err, 0);
+
+	KUNIT_EXPECT_EQ(test, nt_get_reparse_point(&path, back, sizeof(back)),
+			(ssize_t)len);
+	KUNIT_EXPECT_EQ(test, memcmp(rp, back, len), 0);
+
+	KUNIT_ASSERT_EQ(test, nt_query_file_info(&path, NULL, &info), 0);
+	KUNIT_EXPECT_TRUE(test,
+			  info.attributes & NT_FILE_ATTRIBUTE_REPARSE_POINT);
+	KUNIT_EXPECT_EQ(test, info.reparse_tag, 0x00001234u);
+}
+
 static struct kunit_case nt_meta_test_cases[] = {
 	KUNIT_CASE(test_attrs_defaults),
 	KUNIT_CASE(test_attrs_dotfile_is_hidden),
@@ -851,6 +992,9 @@ static struct kunit_case nt_meta_test_cases[] = {
 	KUNIT_CASE(test_security_descriptor_validation),
 	KUNIT_CASE(test_sd_deep_validation_accepts),
 	KUNIT_CASE(test_sd_deep_validation_rejects),
+	KUNIT_CASE(test_reparse_roundtrip),
+	KUNIT_CASE(test_reparse_validation),
+	KUNIT_CASE(test_reparse_non_microsoft),
 	{}
 };
 

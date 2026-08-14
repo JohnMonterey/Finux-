@@ -440,7 +440,8 @@ Stage                                          State
                                               gated by POSIX (see below)
 4. Create/open, dispositions, collisions      implemented
 4. Share modes, delete-on-close, delete-pending implemented
-4. Alternate streams, reparse points, 8.3     parsed only; not stored
+4. Reparse points (tag + payload storage)     stored and reported
+4. Alternate streams, 8.3 short names          parsed only; not stored
 5. Byte-range locks                           designed; not implemented
 6. System volume layout (C:\Windows, ...)     volume concept implemented
 7. Win32 subsystem hooks                      partial; see below
@@ -602,18 +603,33 @@ What stages 4 and 5 will need
 
 Recorded here so the design is not lost.
 
-Streams and reparse points (stage 4)
-------------------------------------
+Alternate data streams (stage 4)
+--------------------------------
 
 A named stream needs a real backing object, not an xattr: xattrs are
 size-limited and an alternate data stream is not.  The plan is a hidden
 per-file store with an xattr fast path for small streams, keeping the
-unnamed ``$DATA`` stream as the file itself.
+unnamed ``$DATA`` stream as the file itself.  This is the last piece of
+stage 4 still parse-only; reparse points, which the parser also only
+classified before, are now stored and reported (see just above).
 
-Reparse points need tag plus arbitrary payload, so a Linux symlink alone
-is not sufficient.  A symlink is a valid optimised backing for
-``IO_REPARSE_TAG_SYMLINK``, but the tag and payload must stay visible to
-the NT personality.
+Reparse points need a tag plus an arbitrary payload, so a Linux symlink
+alone is not sufficient.  These are now stored (fs/ntpers/meta.c): a
+complete ``REPARSE_DATA_BUFFER`` - the tag, the declared length, and the
+payload, including the 16-byte GUID a non-Microsoft tag carries - is
+validated the way ``FSCTL_SET_REPARSE_POINT`` validates it and kept
+verbatim in the ``user.nt.reparse`` xattr, so ``FSCTL_GET_REPARSE_POINT``
+returns exactly what was set.  A file that has one reports
+``FILE_ATTRIBUTE_REPARSE_POINT`` and its tag through
+``nt_query_file_info()``.  A Linux symlink remains the optimised backing
+for ``IO_REPARSE_TAG_SYMLINK`` and reports that tag without needing stored
+data.
+
+What is stored and reported, not yet acted on, is *traversal*: hitting a
+mount-point or junction reparse point during resolution does not redirect
+to its target the way the NT IO manager's STATUS_REPARSE loop does.  The
+tag is visible so a higher layer can implement that; the personality does
+not yet.
 
 Create, open and handle semantics
 ---------------------------------

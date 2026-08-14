@@ -523,6 +523,10 @@ ssize_t nt_get_security_descriptor(const struct path *path, void *buf,
 				   size_t size);
 int nt_set_security_descriptor(const struct path *path, const void *buf,
 			       size_t size);
+int nt_set_reparse_point(const struct path *path, const void *buf,
+			 size_t size);
+ssize_t nt_get_reparse_point(const struct path *path, void *buf, size_t size);
+int nt_delete_reparse_point(const struct path *path);
 
 /* --- subsystem init (fs/ntpers/main.c) ------------------------------- */
 

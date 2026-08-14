@@ -76,6 +76,22 @@
 #define NT_XATTR_DOS_ATTRIB	"user.nt.dos_attrib"
 #define NT_XATTR_CREATION_TIME	"user.nt.crtime"
 #define NT_XATTR_SECURITY	"security.nt.sd"
+#define NT_XATTR_REPARSE	"user.nt.reparse"
+
+/*
+ * A reparse point's on-disk form, as FSCTL_SET_REPARSE_POINT delivers it.
+ * A Microsoft tag (high bit set) uses this header directly; a
+ * non-Microsoft tag inserts a 16-byte GUID between the header and the
+ * payload (REPARSE_GUID_DATA_BUFFER).  Mirrors NT's REPARSE_DATA_BUFFER.
+ */
+struct nt_reparse_header {
+	__le32	tag;
+	__le16	data_length;
+	__le16	reserved;
+};
+
+/* A non-Microsoft reparse point carries a GUID after the header. */
+#define NT_REPARSE_GUID_SIZE	16
 
 /*
  * The write bits READONLY took away, so that clearing it can put back
@@ -618,6 +634,8 @@ static void nt_build_file_ids(const struct kstat *stat,
 	memcpy(info->file_id_128 + 12, &serial, sizeof(serial));
 }
 
+static int nt_reparse_query_tag(const struct path *path, u32 *tag);
+
 /**
  * nt_query_file_info - answer NT's questions about a file
  * @path: the file
@@ -668,7 +686,14 @@ int nt_query_file_info(const struct path *path, struct nt_volume *vol,
 					    have_stored, &stat);
 	}
 
-	if (info->attributes & NT_FILE_ATTRIBUTE_REPARSE_POINT)
+	/*
+	 * A stored reparse point wins: it names its own tag.  Failing that,
+	 * a symlink is the one thing a generic filesystem represents that
+	 * behaves like a reparse point, and it reports the SYMLINK tag.
+	 */
+	if (nt_reparse_query_tag(path, &info->reparse_tag) == 0)
+		info->attributes |= NT_FILE_ATTRIBUTE_REPARSE_POINT;
+	else if (info->attributes & NT_FILE_ATTRIBUTE_REPARSE_POINT)
 		info->reparse_tag = NT_IO_REPARSE_TAG_SYMLINK;
 
 	/*
@@ -915,3 +940,157 @@ int nt_set_security_descriptor(const struct path *path, const void *buf,
 	return err;
 }
 EXPORT_SYMBOL_GPL(nt_set_security_descriptor);
+
+/*
+ * Validate a reparse buffer the way FSCTL_SET_REPARSE_POINT does.
+ *
+ * The buffer a caller hands in is a whole REPARSE_DATA_BUFFER: a tag, a
+ * payload length, and the payload.  A Microsoft tag (high bit set) has an
+ * 8-byte header; any other tag is a third-party reparse point and carries
+ * a 16-byte GUID after the header, so its fixed part is 24 bytes.  In both
+ * forms the declared data_length must match the payload actually present,
+ * and the whole thing must fit inside the NT maximum - a header that lies
+ * about its length is exactly what a later reader must not be handed.
+ */
+static bool nt_reparse_valid(const void *buf, size_t size)
+{
+	const struct nt_reparse_header *h = buf;
+	size_t fixed, data_len;
+	u32 tag;
+
+	if (size < sizeof(*h) || size > NT_MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+		return false;
+
+	tag = le32_to_cpu(h->tag);
+	if (tag == NT_IO_REPARSE_TAG_RESERVED_ZERO)
+		return false;
+
+	fixed = sizeof(*h);
+	if (!(tag & NT_IO_REPARSE_TAG_MICROSOFT))
+		fixed += NT_REPARSE_GUID_SIZE;
+	if (size < fixed)
+		return false;
+
+	data_len = le16_to_cpu(h->data_length);
+	return data_len == size - fixed;
+}
+
+/**
+ * nt_set_reparse_point - attach a reparse point to a file (FSCTL_SET_REPARSE_POINT)
+ * @path: the file or directory
+ * @buf:  a complete REPARSE_DATA_BUFFER (tag, length, payload)
+ * @size: its length
+ *
+ * Returns 0, -EINVAL for a malformed buffer, or an errno from the store.
+ * The buffer is kept verbatim so a later FSCTL_GET_REPARSE_POINT returns
+ * exactly what was set, GUID and all.
+ */
+int nt_set_reparse_point(const struct path *path, const void *buf,
+			 size_t size)
+{
+	int err;
+
+	if (!path || !path->dentry || !buf)
+		return -EINVAL;
+	if (!nt_reparse_valid(buf, size))
+		return -EINVAL;
+
+	err = mnt_want_write(path->mnt);
+	if (err)
+		return err;
+
+	err = vfs_setxattr(nt_idmap(path), path->dentry, NT_XATTR_REPARSE,
+			   buf, size, 0);
+
+	mnt_drop_write(path->mnt);
+	return err;
+}
+EXPORT_SYMBOL_GPL(nt_set_reparse_point);
+
+/**
+ * nt_get_reparse_point - read a file's reparse point (FSCTL_GET_REPARSE_POINT)
+ * @path: the file or directory
+ * @buf:  where to put the REPARSE_DATA_BUFFER, or NULL to query the size
+ * @size: size of @buf
+ *
+ * Returns the number of bytes (or the size needed when @buf is NULL),
+ * -ENODATA if the file has no reparse point, or another negative errno.
+ */
+ssize_t nt_get_reparse_point(const struct path *path, void *buf, size_t size)
+{
+	if (!path || !path->dentry)
+		return -EINVAL;
+
+	return vfs_getxattr(nt_idmap(path), path->dentry, NT_XATTR_REPARSE,
+			    buf, size);
+}
+EXPORT_SYMBOL_GPL(nt_get_reparse_point);
+
+/**
+ * nt_delete_reparse_point - remove a reparse point (FSCTL_DELETE_REPARSE_POINT)
+ * @path: the file or directory
+ *
+ * Returns 0, -ENODATA if there was none, or another negative errno.
+ */
+int nt_delete_reparse_point(const struct path *path)
+{
+	int err;
+
+	if (!path || !path->dentry)
+		return -EINVAL;
+
+	err = mnt_want_write(path->mnt);
+	if (err)
+		return err;
+
+	err = vfs_removexattr(nt_idmap(path), path->dentry, NT_XATTR_REPARSE);
+
+	mnt_drop_write(path->mnt);
+	return err;
+}
+EXPORT_SYMBOL_GPL(nt_delete_reparse_point);
+
+/*
+ * Report the reparse tag of a stored reparse point, if there is one.
+ *
+ * The tag is the first four bytes, but vfs_getxattr() is all-or-nothing:
+ * a buffer smaller than the value yields -ERANGE and copies nothing, so
+ * the header cannot simply be read off the front.  A small stack buffer
+ * covers the ordinary case - a symlink or mount-point reparse buffer is
+ * well under 64 bytes - and only a reparse point larger than that falls
+ * back to a heap read.  A file with no reparse point costs one -ENODATA
+ * and no allocation.  Returns 0 and fills @tag, or a negative errno.
+ */
+static int nt_reparse_query_tag(const struct path *path, u32 *tag)
+{
+	u8 small[64];
+	void *buf = small;
+	ssize_t got;
+
+	got = vfs_getxattr(nt_idmap(path), path->dentry, NT_XATTR_REPARSE,
+			   small, sizeof(small));
+	if (got == -ERANGE) {
+		got = vfs_getxattr(nt_idmap(path), path->dentry,
+				   NT_XATTR_REPARSE, NULL, 0);
+		if (got < 0)
+			return got;
+		buf = kmalloc(got, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		got = vfs_getxattr(nt_idmap(path), path->dentry,
+				   NT_XATTR_REPARSE, buf, got);
+	}
+	if (got < 0)
+		goto out;
+	if (got < (ssize_t)sizeof(struct nt_reparse_header)) {
+		got = -EINVAL;
+		goto out;
+	}
+
+	*tag = le32_to_cpu(*(__le32 *)buf);
+	got = 0;
+out:
+	if (buf != small)
+		kfree(buf);
+	return got;
+}
