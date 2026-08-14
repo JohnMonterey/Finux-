@@ -4,5 +4,6 @@ CFLAGS += -Wall -Werror -O2 $(KHDR_INCLUDES)
 LDLIBS :=
 
 TEST_GEN_PROGS := binfmt_pe_test
+TEST_GEN_PROGS += binfmt_pe_nt_io_test
 
 include ../lib.mk
