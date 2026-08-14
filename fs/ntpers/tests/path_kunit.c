@@ -392,6 +392,143 @@ static void test_component_too_long(struct kunit *test)
 }
 
 /*
+ * The component limit counts UTF-16 code units, not bytes.
+ *
+ * NT_MAX_COMPONENT is an NTFS limit and NTFS stores names as UTF-16, so
+ * 255 is a count of code units.  This subsystem holds names as UTF-8,
+ * where the two are equal only for ASCII: a CJK character is one code
+ * unit and three bytes, and one outside the BMP is two code units and
+ * four bytes.
+ *
+ * Comparing bytes therefore rejected names NTFS accepts, and the failure
+ * was invisible in ASCII - which is why the test above did not catch it.
+ * A hundred-character Japanese directory name is a real thing to find in
+ * a game install.
+ */
+static void test_component_limit_counts_code_units(struct kunit *test)
+{
+	struct nt_path_test_ctx *ctx = test->priv;
+	const char *cjk = "\xe6\x97\xa5";	/* U+65E5, 3 bytes, 1 unit */
+	const char *pua = "\xf0\x9f\x98\x80";	/* U+1F600, 4 bytes, 2 units */
+	char *path;
+	size_t len;
+	int i;
+
+	path = kunit_kzalloc(test, 2048, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, path);
+
+	/*
+	 * 200 CJK characters: 200 code units, comfortably inside the
+	 * limit, and 600 bytes, which the byte comparison refused.
+	 */
+	memcpy(path, "C:\\", 3);
+	len = 3;
+	for (i = 0; i < 200; i++, len += 3)
+		memcpy(path + len, cjk, 3);
+
+	KUNIT_EXPECT_EQ_MSG(test, nt_path_parse(path, len, 0, ctx->buf,
+						NT_PATH_BUF_SIZE, &ctx->parse),
+			    0,
+			    "200 CJK characters is 200 code units, not 600");
+
+	/* 255 of them is exactly the limit. */
+	memcpy(path, "C:\\", 3);
+	len = 3;
+	for (i = 0; i < NT_MAX_COMPONENT; i++, len += 3)
+		memcpy(path + len, cjk, 3);
+	KUNIT_EXPECT_EQ(test, nt_path_parse(path, len, 0, ctx->buf,
+					    NT_PATH_BUF_SIZE, &ctx->parse), 0);
+
+	/* 256 is over it, by code units rather than by bytes. */
+	memcpy(path + len, cjk, 3);
+	len += 3;
+	KUNIT_EXPECT_EQ(test, nt_path_parse(path, len, 0, ctx->buf,
+					    NT_PATH_BUF_SIZE, &ctx->parse),
+			-ENAMETOOLONG);
+
+	/*
+	 * Characters outside the BMP need a surrogate pair, so they cost
+	 * two units each: 128 of them is 256 units and must be refused,
+	 * even though 127 of them fits.
+	 */
+	memcpy(path, "C:\\", 3);
+	len = 3;
+	for (i = 0; i < 127; i++, len += 4)
+		memcpy(path + len, pua, 4);
+	KUNIT_EXPECT_EQ_MSG(test, nt_path_parse(path, len, 0, ctx->buf,
+						NT_PATH_BUF_SIZE, &ctx->parse),
+			    0, "127 astral characters is 254 code units");
+
+	memcpy(path + len, pua, 4);
+	len += 4;
+	KUNIT_EXPECT_EQ_MSG(test, nt_path_parse(path, len, 0, ctx->buf,
+						NT_PATH_BUF_SIZE, &ctx->parse),
+			    -ENAMETOOLONG,
+			    "128 astral characters is 256 code units");
+}
+
+/*
+ * A name that is not valid UTF-8 still has to be addressable.
+ *
+ * Linux filenames are arbitrary bytes, and a file that exists on disk
+ * cannot be made unreachable by this subsystem's opinion of its
+ * encoding.  Invalid sequences are counted a byte at a time, which can
+ * undercount against the NT limit; that is harmless, because the buffer
+ * bounds are enforced separately and are what actually protects memory.
+ */
+static void test_invalid_utf8_is_not_rejected(struct kunit *test)
+{
+	struct nt_path_test_ctx *ctx = test->priv;
+	char *path;
+	size_t len;
+	int i;
+
+	path = kunit_kzalloc(test, 512, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, path);
+
+	/*
+	 * A lone continuation byte, an invalid lead byte, and a lead byte
+	 * with nothing after it.  Spelled out rather than written as a
+	 * string literal so the length cannot drift away from the content.
+	 */
+	{
+		static const unsigned char junk[] = {
+			'C', ':', '\\', 'b', 'a', 'd', 0xff, 0x80,
+			'n', 'a', 'm', 'e', 0xc3,
+		};
+
+		memcpy(path, junk, sizeof(junk));
+		KUNIT_EXPECT_EQ(test, nt_path_parse(path, sizeof(junk), 0,
+						    ctx->buf, NT_PATH_BUF_SIZE,
+						    &ctx->parse), 0);
+	}
+
+	/* A truncated three-byte sequence at the very end of a component. */
+	{
+		static const unsigned char cut[] = {
+			'C', ':', '\\', 'x', 0xe6, 0x97,
+		};
+
+		memcpy(path, cut, sizeof(cut));
+		KUNIT_EXPECT_EQ(test, nt_path_parse(path, sizeof(cut), 0,
+						    ctx->buf, NT_PATH_BUF_SIZE,
+						    &ctx->parse), 0);
+	}
+
+	/* Counted as one unit each, so 255 such bytes still fit. */
+	memcpy(path, "C:\\", 3);
+	len = 3;
+	for (i = 0; i < NT_MAX_COMPONENT; i++, len++)
+		path[len] = (char)0x80;
+	KUNIT_EXPECT_EQ(test, nt_path_parse(path, len, 0, ctx->buf,
+					    NT_PATH_BUF_SIZE, &ctx->parse), 0);
+	path[len++] = (char)0x80;
+	KUNIT_EXPECT_EQ(test, nt_path_parse(path, len, 0, ctx->buf,
+					    NT_PATH_BUF_SIZE, &ctx->parse),
+			-ENAMETOOLONG);
+}
+
+/*
  * MAX_PATH is a Win32 limit and nothing else.  It is reported always and
  * enforced only when the caller says it is a Win32 caller.
  */
@@ -600,6 +737,8 @@ static struct kunit_case nt_path_test_cases[] = {
 	KUNIT_CASE(test_invalid_characters),
 	KUNIT_CASE(test_empty_and_nul),
 	KUNIT_CASE(test_component_too_long),
+	KUNIT_CASE(test_component_limit_counts_code_units),
+	KUNIT_CASE(test_invalid_utf8_is_not_rejected),
 	KUNIT_CASE(test_max_path_is_win32_only),
 	KUNIT_CASE(test_deep_path),
 	KUNIT_CASE(test_buffer_too_small),

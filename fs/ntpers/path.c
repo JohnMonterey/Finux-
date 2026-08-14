@@ -57,6 +57,69 @@ static bool nt_char_is_illegal(unsigned char c)
 	}
 }
 
+/**
+ * nt_utf16_len - how many UTF-16 code units a UTF-8 run occupies
+ * @s:   the bytes
+ * @len: how many of them
+ *
+ * Every NT and NTFS pathname limit is expressed in UTF-16 code units,
+ * because that is what NTFS stores and what the W APIs count.  This
+ * subsystem holds names as UTF-8, where the two differ for anything
+ * outside ASCII: a CJK character is three bytes and one code unit, and
+ * one outside the BMP is four bytes and two, because NT needs a
+ * surrogate pair for it.
+ *
+ * Comparing byte counts against those limits is therefore wrong in the
+ * direction of rejecting names NTFS accepts - a hundred-character
+ * Japanese directory name is a hundred code units and three hundred
+ * bytes.  Buffer bounds are enforced separately and are not affected by
+ * this; getting it wrong could only ever refuse a valid name, never
+ * overrun anything.
+ *
+ * Linux filenames are arbitrary bytes and need not be valid UTF-8.  An
+ * invalid sequence is counted a byte at a time rather than rejected,
+ * because a name that exists on disk has to remain addressable.  That
+ * can undercount a malformed name against the NT limit, which costs
+ * nothing: the buffer checks still bound it.
+ */
+static size_t nt_utf16_len(const char *s, size_t len)
+{
+	size_t units = 0, i = 0;
+
+	while (i < len) {
+		unsigned char c = s[i];
+		size_t seq, k;
+
+		if (c < 0x80)
+			seq = 1;
+		else if ((c & 0xE0) == 0xC0)
+			seq = 2;
+		else if ((c & 0xF0) == 0xE0)
+			seq = 3;
+		else if ((c & 0xF8) == 0xF0)
+			seq = 4;
+		else
+			seq = 1;	/* stray continuation or invalid lead */
+
+		/* A sequence running off the end is not one. */
+		if (i + seq > len)
+			seq = 1;
+
+		/* Nor is one whose continuation bytes are missing. */
+		for (k = 1; k < seq; k++) {
+			if ((s[i + k] & 0xC0) != 0x80) {
+				seq = 1;
+				break;
+			}
+		}
+
+		units += (seq == 4) ? 2 : 1;
+		i += seq;
+	}
+
+	return units;
+}
+
 /* The kernel has no memrchr(); find the last '/' in a known-length run. */
 static char *nt_last_slash(char *start, size_t len)
 {
@@ -140,7 +203,7 @@ static int nt_split_stream(struct nt_path_parse *p, const char *comp,
 		p->stream_type = NT_STREAM_TYPE_DATA;
 	}
 
-	if (snamelen > NT_MAX_COMPONENT)
+	if (nt_utf16_len(sname, snamelen) > NT_MAX_COMPONENT)
 		return -ENAMETOOLONG;
 
 	*len = colon - comp;
@@ -237,7 +300,7 @@ static int nt_emit_component(struct nt_path_parse *p, char **out,
 
 	if (len == 0)
 		return 0;
-	if (len > NT_MAX_COMPONENT)
+	if (nt_utf16_len(comp, len) > NT_MAX_COMPONENT)
 		return -ENAMETOOLONG;
 
 	/*
@@ -503,7 +566,7 @@ int nt_path_parse(const char *name, size_t len, u32 flags,
 		return -ENOENT;
 	if (memchr(name, '\0', len))
 		return -EINVAL;
-	if (len > NT_MAX_NT_PATH)
+	if (nt_utf16_len(name, len) > NT_MAX_NT_PATH)
 		return -ENAMETOOLONG;
 
 	end = name + len;
