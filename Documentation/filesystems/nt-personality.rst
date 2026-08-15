@@ -671,6 +671,50 @@ those calls resolve against and the system-call surface they reach it through.
 The loader, the handle table, the NT file calls and this dispatch path are the
 concrete thing those DLLs plug into.
 
+Dynamic linking
+===============
+
+A freestanding PE that issues its own system calls is the exception; a real
+Windows program imports its services from a DLL.  So the loader is, in part, a
+dynamic linker: it reads a PE's imports, loads the DLLs they name, and binds
+the import address table (IAT) to the exported code.
+
+The two on-disk tables are parsed as pure, bounds-checked format logic
+(``fs/binfmt_pe.c``, unit tested).  Every read of the image goes through one
+``struct pe_image_reader`` choke point that refuses an out-of-range or
+overflowing access before the backing read runs, so the same parsers serve a
+flat test buffer and, in the loader, the mapped image via ``copy_from_user``.
+The export parser resolves a name (through the name-ordinal table) or an
+ordinal (biased by the directory's Base) to a function RVA, and reports an RVA
+that lands inside the export directory as an unresolved forwarder rather than
+chasing it.  The import parser walks the descriptor array, decodes by-ordinal
+and by-name thunks, and yields each import's IAT slot RVA.
+
+``nt_load_dll()`` resolves a dependency by name in ``C:\Windows\System32``
+through the NT path resolver - the same namespace the process itself uses -
+opens it, maps it with the shared image mapper (the executable and a DLL take
+the same reserve/map/relocate path), and digests its export directory.  The
+DLL's mapping lives in the process for its lifetime, because the IAT will point
+into it.  ``ntdll.dll`` itself is, for now, a small real DLL whose exports are
+thin syscall stubs (``mov r10,rcx; mov eax,N; syscall; ret``) - the same shape
+Windows' ntdll has; a native call through the IAT into such a stub lands its
+arguments exactly where the NT dispatcher reads them.
+
+Binding runs after the image is mapped and the task is in its NT personality,
+and before the entry point: for each import the DLL is loaded once (cached, so
+a name is mapped a single time), the symbol is resolved against its exports,
+and the absolute address is written into the IAT slot with the same FOLL_FORCE
+write relocations use, so a slot in read-only ``.idata`` can be patched.  A
+symbol that does not resolve - absent, or an unchased forwarder - fails the
+load rather than binding a bad address; an image with no imports binds nothing
+and still runs.
+
+What is deliberately not done yet, and refused or ignored rather than faked:
+DLLs that themselves import (dependencies are one level deep), forwarder
+exports, delay-load and bound imports, ``DllMain`` and TLS callbacks (never
+run), and any DLL unload path (mappings persist until the process exits).  The
+per-image dependency cache is a small fixed size.
+
 Testing
 =======
 
@@ -700,9 +744,12 @@ the same static binary doubles as a UML ``init``::
     make -C tools/testing/selftests TARGETS=nt_syscall run_tests
 
 End-to-end selftests that build real native PEs on disk and execve() them:
-``binfmt_pe_test`` checks the loader ran the image, and ``binfmt_pe_nt_io_test``
+``binfmt_pe_test`` checks the loader ran the image, ``binfmt_pe_nt_io_test``
 has the loaded PE do genuine file I/O entirely through NT system calls and then
-verifies the resulting file from the ordinary Linux side::
+verifies the resulting file from the ordinary Linux side, and
+``binfmt_pe_import_test`` builds a PE that imports its NT services from
+``ntdll.dll`` and calls them only through its import address table (no
+``syscall`` of its own), doing the same file round trip::
 
     make -C tools/testing/selftests TARGETS=binfmt_pe run_tests
 
@@ -734,7 +781,53 @@ Stage                                          State
 9. ABI-real syscall dispatch (x86-64/UML)     implemented; seccomp/audit
                                               bypass, see below
 9. PE runs as an NT process                   implemented; minimal TEB/PEB
+10. PE export/import directory parsers         implemented
+10. DLL loading + ntdll.dll (export stubs)     implemented; single level
+10. Import binding (IAT against ntdll)         implemented; a linked PE runs
 ============================================  =========================
+
+See "Verification status and limitations" below for what "implemented"
+does and does not mean here.
+
+Verification status and limitations
+===================================
+
+"Implemented" above means the code exists, builds, and passes the KUnit and
+selftest coverage described under "Testing".  It does not mean this can run
+Windows software.  Read this section before drawing conclusions from the
+status table.
+
+- **Tested under UML and KUnit only.**  Every end-to-end run in this document
+  is a User Mode Linux boot or a KUnit suite.  The subsystem has not been
+  booted on real hardware or under QEMU.
+
+- **The x86-64 syscall dispatch has not been executed.**  The native
+  ``do_syscall_64`` hook is compiled and links into a real x86-64 ``vmlinux``,
+  but the path that has actually *run* is the parallel UML guest-syscall hook
+  (identical marshalling, different entry).  Proving the production x86-64
+  dispatch needs a real x86-64 boot, which has not happened.
+
+- **Every test PE is a small hand-built image.**  The selftests assemble PEs
+  of a few hundred bytes that call the specific NT services implemented here.
+  No real Windows executable has been loaded, and none would run: a real
+  binary imports from ``kernel32``/``user32`` (which do not exist here),
+  expects a fully populated PEB/TEB with the process parameters and loader
+  module list (only a handful of fields are filled), and calls NT services
+  this does not provide (virtual memory, threads, synchronisation, section
+  objects, the Win32 subsystem).  ``ntdll.dll`` here is a stub of syscall
+  thunks, not the real one, whose own initialisation would fail immediately.
+
+- **Access control is POSIX.**  Security descriptors are stored and validated
+  but do not govern access; ``inode_permission`` does.  There is no NT token
+  or SRM.
+
+- **NT-mode syscalls bypass Linux seccomp and audit** (the numbers are a
+  disjoint namespace; the entry hooks branch before that work).  A
+  seccomp-based NT policy is future work.
+
+In short: this is a research-grade foundation - the loader and the NT
+system-call surface are real and are the boundary a Win32 stack would target -
+not a system that runs Windows programs.
 
 File metadata
 =============
