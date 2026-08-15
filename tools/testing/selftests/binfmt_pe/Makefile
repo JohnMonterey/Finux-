@@ -5,5 +5,6 @@ LDLIBS :=
 
 TEST_GEN_PROGS := binfmt_pe_test
 TEST_GEN_PROGS += binfmt_pe_nt_io_test
+TEST_GEN_PROGS += binfmt_pe_import_test
 
 include ../lib.mk

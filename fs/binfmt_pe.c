@@ -25,17 +25,28 @@
  * is what a freestanding native PE needs to reach the kernel the way every
  * real Windows binary does, through NT services rather than Linux ones.
  *
+ * It then binds the image's imports.  A PE that reaches the NT services not
+ * with its own `syscall` instructions but by importing them from ntdll (the
+ * way every real Windows binary does) names ntdll.dll and its Nt* symbols in
+ * its import directory; the loader loads ntdll (nt_load_dll()), resolves each
+ * import against ntdll's export table, and writes the resolved address into
+ * the image's import address table (see pe_bind_imports()).  A `call [IAT]`
+ * then lands in the matching ntdll stub, whose `syscall` reaches the kernel.
+ *
  * It deliberately stops there.  A real Windows program additionally needs
  *
- *   - its imports resolved against ntdll/kernel32 and friends,
  *   - the full RtlUserThreadStart entry protocol and the process-parameter
  *     block the PEB points at (this loader lays out only the handful of
- *     TEB/PEB fields ntdll and the CRT read to find themselves).
+ *     TEB/PEB fields ntdll and the CRT read to find themselves),
+ *   - multi-level dependencies, forwarder exports, delay/bound imports,
+ *     DllMain and TLS callbacks - none of which the import binder does; it
+ *     handles a single level of by-name/by-ordinal imports and refuses
+ *     (rather than fakes) anything beyond that.
  *
- * Neither is needed to *load and start* the image, so neither lives here.
- * They are built on top of this loader.  Where this file makes a
- * simplifying assumption it rejects the image with -ENOEXEC rather than
- * loading it wrongly; those boundaries are called out at each check.
+ * Neither is needed to *load and start* the imported image, so neither lives
+ * here.  They are built on top of this loader.  Where this file makes a
+ * simplifying assumption it rejects the image with a negative errno rather
+ * than loading it wrongly; those boundaries are called out at each check.
  *
  * The on-disk structures come from <linux/pe.h>, which the EFI stub
  * already uses to describe the kernel's own PE header.  PE is a
@@ -91,6 +102,7 @@
 
 /* Data directory indices this loader reads. */
 #define PE_DIR_EXPORT		0
+#define PE_DIR_IMPORT		1
 #define PE_DIR_BASERELOC	5
 
 /*
@@ -120,6 +132,8 @@ struct pe_load_info {
 	loff_t section_table;		/* file offset of the section table */
 	u32 reloc_rva;			/* base relocation table, relative to base */
 	u32 reloc_size;			/* its size in bytes (0 if none) */
+	u32 import_rva;			/* import directory, relative to base */
+	u32 import_size;		/* its size in bytes (0 if none) */
 };
 
 static int load_pe_binary(struct linux_binprm *bprm);
@@ -294,6 +308,8 @@ static int __pe_parse_headers(const void *mz, size_t mz_len,
 	out->section_table = table;
 	out->reloc_rva = 0;
 	out->reloc_size = 0;
+	out->import_rva = 0;
+	out->import_size = 0;
 	return 0;
 }
 
@@ -1202,14 +1218,15 @@ static int pe_user_read(void *ctx, u32 rva, void *buf, u32 len)
  * @reader:	the pe_image_reader @exports reads through; points at @img
  * @exports:	the digested export directory; points at @reader
  *
- * This object owns the reader and reader context that @exports refers to, so
- * it must outlive any use of @exports.  For import binding that is the life of
- * the process: the IAT slots the binder writes point straight into the
- * mapping, so both the mapping and this bookkeeping have to persist.  There is
- * no unload path yet - the mapping and the struct go away with the mm at
- * process exit.  Phase C resolves an export with
+ * This object owns the reader and reader context that @exports refers to, so it
+ * must outlive any use of @exports - that is, the whole import walk that
+ * resolves against it.  The mapping it creates outlives the object, though: the
+ * IAT slots the binder writes point straight into that mapping, so the mapping
+ * persists for the life of the process (it is owned by the mm), while
+ * pe_bind_imports() frees this small per-DLL struct once the walk is done.
+ * There is no DLL unload path yet.  pe_bind_imports() resolves an export with
  * pe_export_by_name(&dll->exports, "Nt..."), which returns an RVA; the address
- * to store in an IAT slot is @base + that RVA, written with pe_write_image().
+ * written into an IAT slot is @base + that RVA, via pe_write_image().
  */
 struct nt_loaded_dll {
 	unsigned long base;
@@ -1248,12 +1265,11 @@ static int pe_parse_dll_headers(const void *mz, size_t mz_len,
  * Deliberately unsupported and refused or ignored rather than faked: a DLL
  * that itself imports from another DLL (single level only - the caller does
  * not recurse), DllMain and TLS callbacks (never run), and forwarder exports
- * (pe_export_by_name() reports them unresolved).  It is marked __maybe_unused
- * because the import-binding caller arrives in phase C; nothing invokes it in
- * this phase.
+ * (pe_export_by_name() reports them unresolved).  pe_bind_imports() calls it
+ * once per distinct dependency DLL an image names.
  */
-static int __maybe_unused nt_load_dll(const char *name,
-				      struct nt_loaded_dll **out)
+static int nt_load_dll(const char *name,
+		       struct nt_loaded_dll **out)
 {
 	struct nt_loaded_dll *dll = NULL;
 	struct section_header *sections = NULL;
@@ -1413,6 +1429,152 @@ out_fput:
 	return retval;
 }
 
+/*
+ * ===========================================================================
+ * Import binding
+ * ===========================================================================
+ *
+ * Bind the main image's imports against the DLLs that satisfy them.  The main
+ * image names each dependency DLL and the symbols it needs in its import
+ * directory (data directory 1); this walks that directory, loads each named DLL
+ * once with nt_load_dll(), resolves every imported symbol against the DLL's
+ * export table, and writes the resolved address into the matching import
+ * address table (IAT) slot.  After this a `call [IAT slot]` in the image lands
+ * on the symbol - for a native PE that is an ntdll stub whose `syscall` reaches
+ * the kernel, so the image needs no `syscall` of its own.
+ *
+ * Boundaries, refused rather than faked (see the file banner): a single level
+ * of dependencies (the DLLs the main image names; nt_load_dll() does not bind a
+ * DLL's own imports), by-name and by-ordinal imports, and no forwarders - an
+ * import that resolves to 0 (absent, or a forwarder pe_export_by_name() reports
+ * as unresolved) fails the load rather than binding a bad address.
+ */
+
+/*
+ * A small cache of the DLLs loaded while binding one image, so each distinct
+ * dependency is nt_load_dll()ed once and reused across all its imports.  The
+ * cap is a safety bound, not a format limit; a real image needs a handful.
+ */
+#define NT_BIND_MAX_DLLS	16
+
+struct nt_bind_dll {
+	struct nt_loaded_dll *dll;
+	char name[PE_MAX_DLL_NAME];
+};
+
+struct nt_bind_ctx {
+	unsigned long load_base;	/* where the main image is mapped */
+	unsigned int ndlls;
+	struct nt_bind_dll dlls[NT_BIND_MAX_DLLS];
+};
+
+/*
+ * pe_parse_imports() callback: resolve one imported symbol and patch its IAT
+ * slot.  Returns 0 to continue the walk or a negative errno to abort it (which
+ * becomes pe_bind_imports()'s result and tears the process down).
+ */
+static int nt_bind_import(void *ctx, const struct pe_import *imp)
+{
+	struct nt_bind_ctx *bc = ctx;
+	struct nt_loaded_dll *dll = NULL;
+	unsigned long addr;
+	unsigned int i;
+	u32 rva;
+	int err;
+
+	/*
+	 * Resolve the DLL: reuse a mapping already loaded for this image, or
+	 * load it once and cache it.  DLL names are matched case-insensitively,
+	 * the way Windows treats them, so a DLL named two different ways is
+	 * loaded (and mapped at its fixed base) only once.
+	 */
+	for (i = 0; i < bc->ndlls; i++) {
+		if (!strcasecmp(bc->dlls[i].name, imp->dll)) {
+			dll = bc->dlls[i].dll;
+			break;
+		}
+	}
+	if (!dll) {
+		if (bc->ndlls >= NT_BIND_MAX_DLLS)
+			return -ELIBMAX;	/* too many dependency DLLs */
+		err = nt_load_dll(imp->dll, &dll);
+		if (err)
+			return err;
+		bc->dlls[bc->ndlls].dll = dll;
+		strscpy(bc->dlls[bc->ndlls].name, imp->dll,
+			sizeof(bc->dlls[bc->ndlls].name));
+		bc->ndlls++;
+	}
+
+	/* Resolve the symbol to an RVA within the DLL's mapping. */
+	if (imp->by_ordinal)
+		rva = pe_export_by_ordinal(&dll->exports, imp->ordinal);
+	else
+		rva = pe_export_by_name(&dll->exports, imp->name);
+
+	/*
+	 * 0 means the DLL does not export the symbol, or exports it only as a
+	 * forwarder (which this loader does not chase): refuse the image rather
+	 * than bind a bad address.
+	 */
+	if (!rva)
+		return -ELIBACC;
+
+	/*
+	 * Patch the IAT slot with the absolute address dll->base + rva.  The
+	 * slot lives in the main image, which may be read-only .rdata, so the
+	 * write goes through the FOLL_FORCE writer, exactly as relocations do.
+	 */
+	addr = dll->base + rva;
+	return pe_write_image(bc->load_base + imp->iat_slot_rva,
+			      &addr, sizeof(addr));
+}
+
+/*
+ * Bind the imports of the main image mapped at @load_base.  An image with no
+ * import directory imports nothing and just runs (the freestanding case).  On
+ * any failure a negative errno is returned and the caller tears the process
+ * down; this runs past the point of no return, like the other late steps.
+ *
+ * Lifetime: the export-resolution bookkeeping (the per-DLL structs) is needed
+ * only during the walk.  Once the IAT holds absolute addresses, they point into
+ * each DLL's mapping, and those mappings live in this mm for the life of the
+ * process - so the small per-DLL structs are released here while the mappings
+ * stay.  A real DLL unload path (refcounts, DllMain) is future work.
+ */
+static int pe_bind_imports(unsigned long load_base,
+			   const struct pe_load_info *pi)
+{
+	struct pe_user_image img = {
+		.base = load_base,
+		.image_size = pi->image_size,
+	};
+	struct pe_image_reader reader = {
+		.read = pe_user_read,
+		.ctx = &img,
+		.image_size = pi->image_size,
+	};
+	struct nt_bind_ctx *bc;
+	unsigned int i;
+	int err;
+
+	if (!pi->import_rva || !pi->import_size)
+		return 0;
+
+	bc = kzalloc_obj(*bc, GFP_KERNEL);
+	if (!bc)
+		return -ENOMEM;
+	bc->load_base = load_base;
+
+	err = pe_parse_imports(&reader, pi->import_rva, pi->import_size,
+			       nt_bind_import, bc);
+
+	for (i = 0; i < bc->ndlls; i++)
+		kfree(bc->dlls[i].dll);
+	kfree(bc);
+	return err;
+}
+
 #endif /* CONFIG_NT_FS_PERSONALITY */
 
 static int load_pe_binary(struct linux_binprm *bprm)
@@ -1475,6 +1637,31 @@ static int load_pe_binary(struct linux_binprm *bprm)
 		if (pi.reloc_size &&
 		    (pi.reloc_rva >= pi.image_size ||
 		     pi.reloc_size > pi.image_size - pi.reloc_rva))
+			goto out;
+	}
+
+	/*
+	 * The import directory is data directory 1, read the same way.  It names
+	 * the DLLs and symbols the image imports; pe_bind_imports() resolves them
+	 * against a loaded ntdll once the image is mapped.  Read here, while we
+	 * can still fail cleanly, and bounds-checked against the image now so the
+	 * later copy_from_user reader can trust the range.
+	 */
+	if (opt.data_dirs > PE_DIR_IMPORT) {
+		struct data_dirent import_dd;
+		loff_t dd_off = (loff_t)peaddr + sizeof(pe) + sizeof(opt) +
+				PE_DIR_IMPORT * sizeof(import_dd);
+
+		retval = pe_read_exact(file, &import_dd, sizeof(import_dd), dd_off);
+		if (retval)
+			goto out;
+		pi.import_rva = import_dd.virtual_address;
+		pi.import_size = import_dd.size;
+
+		retval = -ENOEXEC;
+		if (pi.import_size &&
+		    (pi.import_rva >= pi.image_size ||
+		     pi.import_size > pi.image_size - pi.import_rva))
 			goto out;
 	}
 
@@ -1548,6 +1735,20 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	 * down, the same as the mapping failures above.
 	 */
 	retval = pe_setup_nt_process(load_base, sp, &teb);
+	if (retval)
+		goto out_free;
+
+	/*
+	 * Bind the image's imports now, after the task is in its NT personality,
+	 * so the DLL search resolves C:\Windows\System32\<dll> by the same NT
+	 * path rules the process itself will use.  This completes the image: it
+	 * loads ntdll, resolves every imported Nt* symbol against ntdll's export
+	 * table, and patches the IAT, so a `call [IAT]` reaches an ntdll stub.
+	 * An image with no import directory binds nothing and still runs.  Done
+	 * before start_thread() and past the point of no return - a failure now
+	 * tears the process down, the same as the mapping failures above.
+	 */
+	retval = pe_bind_imports(load_base, &pi);
 	if (retval)
 		goto out_free;
 #endif
