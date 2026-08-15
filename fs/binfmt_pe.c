@@ -49,6 +49,7 @@
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/errno.h>
+#include <linux/file.h>
 #include <linux/binfmts.h>
 #include <linux/personality.h>
 #include <linux/ptrace.h>
@@ -57,6 +58,7 @@
 #include <linux/log2.h>
 #include <linux/string.h>
 #include <linux/pe.h>
+#include <linux/cred.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/nt_syscall.h>
@@ -87,7 +89,8 @@
 #define PE_MIN_FILE_ALIGN	512		/* smallest FileAlignment PE allows */
 #define PE_MAX_FILE_ALIGN	65536		/* largest FileAlignment PE allows */
 
-/* Data directory index of the base relocation table. */
+/* Data directory indices this loader reads. */
+#define PE_DIR_EXPORT		0
 #define PE_DIR_BASERELOC	5
 
 /*
@@ -147,21 +150,25 @@ static int pe_section_prot(u32 flags)
 }
 
 /**
- * pe_parse_headers - validate raw PE headers and digest them
+ * __pe_parse_headers - validate raw PE headers and digest them
  * @mz:		the first bytes of the file (at least the MZ header)
  * @mz_len:	how many bytes @mz points at (bprm->buf is BINPRM_BUF_SIZE)
  * @pe:		the PE/COFF header, already read from the file at mz->peaddr
  * @opt:	the PE32+ optional header, read immediately after @pe
+ * @allow_dll:	accept a DLL (IMAGE_FILE_DLL, possibly no entry point) instead
+ *		of an executable; the EXE path passes false, the dynamic
+ *		linker's DLL path passes true
  * @out:	filled in on success
  *
  * Returns 0 and populates @out, or -ENOEXEC if the file is not a PE image
  * this loader can handle.  This is where every "we only support ..."
  * decision is made, so it is deliberately strict and side-effect free.
+ * pe_parse_headers() and pe_parse_dll_headers() are the two entry points.
  */
-static int pe_parse_headers(const void *mz, size_t mz_len,
-			    const struct pe_hdr *pe,
-			    const struct pe32plus_opt_hdr *opt,
-			    struct pe_load_info *out)
+static int __pe_parse_headers(const void *mz, size_t mz_len,
+			      const struct pe_hdr *pe,
+			      const struct pe32plus_opt_hdr *opt,
+			      bool allow_dll, struct pe_load_info *out)
 {
 	const struct mz_hdr *mzh = mz;
 	unsigned long image_base, image_size, entry, header_size;
@@ -178,15 +185,25 @@ static int pe_parse_headers(const void *mz, size_t mz_len,
 	if (mzh->peaddr < sizeof(*mzh) || mzh->peaddr > PE_MAX_HEADER_OFFSET)
 		return -ENOEXEC;
 
-	/* "PE\0\0", AMD64, an executable image and not a DLL. */
+	/* "PE\0\0", AMD64, an executable image. */
 	if (pe->magic != IMAGE_NT_SIGNATURE)
 		return -ENOEXEC;
 	if (pe->machine != IMAGE_FILE_MACHINE_AMD64)
 		return -ENOEXEC;
 	if (!(pe->flags & IMAGE_FILE_EXECUTABLE_IMAGE))
 		return -ENOEXEC;
-	if (pe->flags & IMAGE_FILE_DLL)
+	/*
+	 * A DLL is a PE image but not a program execve() starts.  The EXE path
+	 * (!allow_dll) refuses one here - the rejection the KUnit suite locks
+	 * in - while the DLL path requires the flag to be set instead, so an
+	 * executable can never be loaded as a dependency by mistake.
+	 */
+	if (allow_dll) {
+		if (!(pe->flags & IMAGE_FILE_DLL))
+			return -ENOEXEC;
+	} else if (pe->flags & IMAGE_FILE_DLL) {
 		return -ENOEXEC;
+	}
 
 	/*
 	 * The optional header must be a PE32+ (64-bit) one and at least as
@@ -239,8 +256,16 @@ static int pe_parse_headers(const void *mz, size_t mz_len,
 	if (image_base > TASK_SIZE || image_size > TASK_SIZE - image_base)
 		return -ENOEXEC;
 
-	/* The entry point and the headers must fall inside the image. */
-	if (!entry || entry >= image_size)
+	/*
+	 * The entry point and the headers must fall inside the image.  An
+	 * executable must have an entry point; a DLL need not - its DllMain
+	 * entry, which this loader does not call, may be absent - so a zero
+	 * entry is tolerated only on the DLL path.  A nonzero entry is
+	 * bounds-checked either way.
+	 */
+	if (entry >= image_size)
+		return -ENOEXEC;
+	if (!allow_dll && !entry)
 		return -ENOEXEC;
 	if (header_size > image_size)
 		return -ENOEXEC;
@@ -270,6 +295,18 @@ static int pe_parse_headers(const void *mz, size_t mz_len,
 	out->reloc_rva = 0;
 	out->reloc_size = 0;
 	return 0;
+}
+
+/*
+ * Validate the headers of a main executable.  Rejects a DLL and requires an
+ * entry point; this is the entry point the EXE loader and the KUnit suite use.
+ */
+static int pe_parse_headers(const void *mz, size_t mz_len,
+			    const struct pe_hdr *pe,
+			    const struct pe32plus_opt_hdr *opt,
+			    struct pe_load_info *out)
+{
+	return __pe_parse_headers(mz, mz_len, pe, opt, false, out);
 }
 
 /*
@@ -900,6 +937,100 @@ out:
 	return err;
 }
 
+/*
+ * Map a whole PE image - the main executable or a DLL dependency - into the
+ * current task's address space and report where it landed.
+ *
+ * This is the shared core of image loading, lifted out of load_pe_binary() so
+ * a DLL is mapped by exactly the same steps: reserve the SizeOfImage range at
+ * a base, map the headers read-only, map each section at its RVA with its own
+ * protection (zero-filling the .bss tail), and apply base relocations if the
+ * image did not land at its preferred base.
+ *
+ * Base selection matches what the ELF loader does for a PIE.  @randomize asks
+ * for a kernel-chosen base (address-space randomisation): a relocatable image
+ * is placed at one and relocated to it.  Otherwise the preferred ImageBase is
+ * reserved with MAP_FIXED_NOREPLACE - which both claims the whole range so a
+ * later section mapping cannot collide with an unrelated allocation, and
+ * reports whether the base is already taken; if it is, a relocatable image
+ * falls back to a kernel-chosen base and a non-relocatable one is refused
+ * rather than loaded at the wrong address.  A DLL passes @randomize false, so
+ * it loads at its preferred base and a RELOCS_STRIPPED DLL whose base is taken
+ * is refused (it cannot be moved).
+ *
+ * On success @load_base_out holds the base and the whole image is mapped.  On
+ * any failure the reserved range is torn back down so no partial mapping is
+ * left behind, and a negative errno is returned; the caller need not unmap.
+ */
+static int pe_map_image(struct file *file, const struct pe_load_info *pi,
+			const struct section_header *sections, bool randomize,
+			unsigned long *load_base_out)
+{
+	unsigned long reserve, load_base, delta;
+	int retval, i;
+
+	if (!pi->relocs_stripped && pi->reloc_size && randomize) {
+		reserve = vm_mmap(NULL, 0, pi->image_size, PROT_NONE,
+				  MAP_PRIVATE | MAP_ANONYMOUS, 0);
+		if (IS_ERR_VALUE(reserve))
+			return (int)reserve;
+		load_base = reserve;
+		delta = load_base - pi->image_base;
+	} else {
+		reserve = vm_mmap(NULL, pi->image_base, pi->image_size, PROT_NONE,
+				  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+				  0);
+		if (!IS_ERR_VALUE(reserve) && reserve == pi->image_base) {
+			load_base = pi->image_base;
+			delta = 0;
+		} else {
+			if (!IS_ERR_VALUE(reserve))
+				vm_munmap(reserve, pi->image_size);
+			if (pi->relocs_stripped || !pi->reloc_size)
+				return -ENOMEM;
+			reserve = vm_mmap(NULL, 0, pi->image_size, PROT_NONE,
+					  MAP_PRIVATE | MAP_ANONYMOUS, 0);
+			if (IS_ERR_VALUE(reserve))
+				return (int)reserve;
+			load_base = reserve;
+			delta = load_base - pi->image_base;
+		}
+	}
+
+	/* Map the headers read-only at the load base, as Windows does. */
+	if (pi->header_size) {
+		unsigned long hlen = PAGE_ALIGN(pi->header_size);
+		unsigned long addr = vm_mmap(file, load_base, hlen, PROT_READ,
+					     MAP_PRIVATE | MAP_FIXED, 0);
+
+		if (IS_ERR_VALUE(addr)) {
+			retval = (int)addr;
+			goto out_unmap;
+		}
+	}
+
+	/* Map each section at its virtual address with its own protection. */
+	for (i = 0; i < pi->nsections; i++) {
+		retval = pe_map_section(file, &sections[i], pi, load_base);
+		if (retval)
+			goto out_unmap;
+	}
+
+	/* Fix up the image if it did not land at its preferred base. */
+	if (delta) {
+		retval = pe_apply_relocations(pi, load_base, delta);
+		if (retval)
+			goto out_unmap;
+	}
+
+	*load_base_out = load_base;
+	return 0;
+
+out_unmap:
+	vm_munmap(load_base, pi->image_size);
+	return retval;
+}
+
 #ifdef CONFIG_NT_FS_PERSONALITY
 
 /*
@@ -1008,6 +1139,280 @@ static int pe_setup_nt_process(unsigned long load_base, unsigned long sp,
 	return 0;
 }
 
+/*
+ * ===========================================================================
+ * DLL dependency loading
+ * ===========================================================================
+ *
+ * A native PE reaches the kernel through NT services that live in ntdll.dll:
+ * its import table names them and its IAT is patched, at load time, with their
+ * addresses inside a loaded ntdll.  nt_load_dll() is the half of that a
+ * dynamic linker needs first - find the DLL, map it, and read its export
+ * table - so a later binding stage (phase C) can resolve each import against
+ * it and write the IAT.  It runs in the exec'ing task's context, so it maps
+ * into the process being built and reads the mapped image with copy_from_user.
+ */
+
+/*
+ * The one directory the DLL search looks in.
+ *
+ * A real Windows loader walks an ordered search path (the application
+ * directory, the system directory, the %PATH%, and so on).  This first cut
+ * resolves a dependency only from the system directory - C:\Windows\System32,
+ * where ntdll and the other NT DLLs live - so a name that is not there fails
+ * rather than being searched for elsewhere.  Widening the search to more
+ * directories is future work, called out here so this is not mistaken for a
+ * complete loader search order.  The name is joined onto this prefix and
+ * resolved by the ordinary NT path rules (case-insensitive, over the C:
+ * volume), so it is subject to the same volume and mount setup as any other
+ * NT path.
+ */
+#define NT_DLL_SEARCH_DIR	"C:\\Windows\\System32\\"
+
+/*
+ * A copy_from_user-backed pe_image_reader over an image already mapped into
+ * the current task.  The dynamic-linking parsers reach an image only through a
+ * struct pe_image_reader; because the loader runs in the exec'ing task's
+ * context, copy_from_user reads the mapped DLL directly.  This is the reader
+ * Phase A anticipated phase B would supply.  pe_reader_read() has already
+ * bounded [rva, rva+len) against image_size before this is called, so the
+ * address computed here cannot run past the mapped image.
+ */
+struct pe_user_image {
+	unsigned long base;	/* image base as a user address */
+	u32 image_size;
+};
+
+static int pe_user_read(void *ctx, u32 rva, void *buf, u32 len)
+{
+	const struct pe_user_image *img = ctx;
+
+	if (copy_from_user(buf, (const void __user *)(img->base + rva), len))
+		return -EFAULT;
+	return 0;
+}
+
+/**
+ * struct nt_loaded_dll - a DLL mapped into the process for import binding
+ * @base:	user address the DLL is mapped at (its ImageBase, unless it was
+ *		relocated)
+ * @image_size:	its SizeOfImage
+ * @entry:	DllMain RVA, or 0; recorded but never called (no DllMain support)
+ * @img:	the copy_from_user reader context over the mapped image
+ * @reader:	the pe_image_reader @exports reads through; points at @img
+ * @exports:	the digested export directory; points at @reader
+ *
+ * This object owns the reader and reader context that @exports refers to, so
+ * it must outlive any use of @exports.  For import binding that is the life of
+ * the process: the IAT slots the binder writes point straight into the
+ * mapping, so both the mapping and this bookkeeping have to persist.  There is
+ * no unload path yet - the mapping and the struct go away with the mm at
+ * process exit.  Phase C resolves an export with
+ * pe_export_by_name(&dll->exports, "Nt..."), which returns an RVA; the address
+ * to store in an IAT slot is @base + that RVA, written with pe_write_image().
+ */
+struct nt_loaded_dll {
+	unsigned long base;
+	unsigned long image_size;
+	unsigned long entry;
+	struct pe_user_image img;
+	struct pe_image_reader reader;
+	struct pe_exports exports;
+};
+
+/*
+ * Validate the headers of a DLL dependency.  Permits (indeed requires)
+ * IMAGE_FILE_DLL and tolerates a zero entry point; otherwise identical to the
+ * executable validation.
+ */
+static int pe_parse_dll_headers(const void *mz, size_t mz_len,
+				const struct pe_hdr *pe,
+				const struct pe32plus_opt_hdr *opt,
+				struct pe_load_info *out)
+{
+	return __pe_parse_headers(mz, mz_len, pe, opt, true, out);
+}
+
+/*
+ * Load a DLL dependency by name into the current process and parse its
+ * exports.
+ *
+ * Resolves @name in C:\Windows\System32 through the NT path resolver, opens
+ * it read-only, validates it as a DLL, maps it with pe_map_image() (at its
+ * preferred base; a RELOCS_STRIPPED DLL that cannot get that base is refused,
+ * since it cannot be relocated), and digests its export directory into a
+ * copy_from_user-backed struct pe_exports.  On success *@out owns the export
+ * view and the mapping stays for the life of the process; on any failure
+ * nothing is left mapped or allocated and a negative errno is returned.
+ *
+ * Deliberately unsupported and refused or ignored rather than faked: a DLL
+ * that itself imports from another DLL (single level only - the caller does
+ * not recurse), DllMain and TLS callbacks (never run), and forwarder exports
+ * (pe_export_by_name() reports them unresolved).  It is marked __maybe_unused
+ * because the import-binding caller arrives in phase C; nothing invokes it in
+ * this phase.
+ */
+static int __maybe_unused nt_load_dll(const char *name,
+				      struct nt_loaded_dll **out)
+{
+	struct nt_loaded_dll *dll = NULL;
+	struct section_header *sections = NULL;
+	struct nt_path ntp = {};
+	struct file *file;
+	struct pe_hdr pe;
+	struct pe32plus_opt_hdr opt;
+	struct pe_load_info pi;
+	struct data_dirent exp_dd = {};
+	struct mz_hdr mz;
+	unsigned long load_base;
+	char *path;
+	u32 peaddr;
+	int retval;
+
+	if (!name || !out)
+		return -EINVAL;
+
+	/* Build C:\Windows\System32\<name> and resolve it by NT path rules. */
+	path = kasprintf(GFP_KERNEL, NT_DLL_SEARCH_DIR "%s", name);
+	if (!path)
+		return -ENOMEM;
+	retval = nt_kern_path(path,
+			      NT_RESOLVE_FOLLOW | NT_RESOLVE_CASE_INSENSITIVE,
+			      &ntp);
+	kfree(path);
+	if (retval)
+		return retval;
+
+	file = dentry_open(&ntp.path, O_RDONLY | O_LARGEFILE, current_cred());
+	nt_path_put(&ntp);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	if (!can_mmap_file(file)) {
+		retval = -ENOEXEC;
+		goto out_fput;
+	}
+
+	/* Read and validate the headers, in DLL mode. */
+	retval = pe_read_exact(file, &mz, sizeof(mz), 0);
+	if (retval)
+		goto out_fput;
+	retval = -ENOEXEC;
+	if (mz.magic != IMAGE_DOS_SIGNATURE)
+		goto out_fput;
+	peaddr = mz.peaddr;
+	if (peaddr < sizeof(mz) || peaddr > PE_MAX_HEADER_OFFSET)
+		goto out_fput;
+
+	retval = pe_read_exact(file, &pe, sizeof(pe), peaddr);
+	if (retval)
+		goto out_fput;
+	retval = pe_read_exact(file, &opt, sizeof(opt),
+			       (loff_t)peaddr + sizeof(pe));
+	if (retval)
+		goto out_fput;
+
+	retval = pe_parse_dll_headers(&mz, sizeof(mz), &pe, &opt, &pi);
+	if (retval)
+		goto out_fput;
+
+	/* The export directory is data directory 0; a DLL without one is useless. */
+	retval = -ENOEXEC;
+	if (opt.data_dirs <= PE_DIR_EXPORT)
+		goto out_fput;
+	retval = pe_read_exact(file, &exp_dd, sizeof(exp_dd),
+			       (loff_t)peaddr + sizeof(pe) + sizeof(opt) +
+			       PE_DIR_EXPORT * sizeof(exp_dd));
+	if (retval)
+		goto out_fput;
+	retval = -ENOEXEC;
+	if (!exp_dd.virtual_address || !exp_dd.size ||
+	    exp_dd.virtual_address >= pi.image_size ||
+	    exp_dd.size > pi.image_size - exp_dd.virtual_address)
+		goto out_fput;
+
+	/*
+	 * The base relocation table, read the same way the EXE path reads it, so
+	 * that a relocatable DLL whose preferred base is taken can still be
+	 * placed.  A RELOCS_STRIPPED DLL leaves these zero and pe_map_image()
+	 * refuses to move it, which is fine for a DLL pinned at a free base.
+	 */
+	if (opt.data_dirs > PE_DIR_BASERELOC) {
+		struct data_dirent reloc_dd;
+
+		retval = pe_read_exact(file, &reloc_dd, sizeof(reloc_dd),
+				       (loff_t)peaddr + sizeof(pe) + sizeof(opt) +
+				       PE_DIR_BASERELOC * sizeof(reloc_dd));
+		if (retval)
+			goto out_fput;
+		pi.reloc_rva = reloc_dd.virtual_address;
+		pi.reloc_size = reloc_dd.size;
+		retval = -ENOEXEC;
+		if (pi.reloc_size &&
+		    (pi.reloc_rva >= pi.image_size ||
+		     pi.reloc_size > pi.image_size - pi.reloc_rva))
+			goto out_fput;
+	}
+
+	/* Slurp the section table. */
+	sections = kvmalloc_array(pi.nsections, sizeof(*sections), GFP_KERNEL);
+	if (!sections) {
+		retval = -ENOMEM;
+		goto out_fput;
+	}
+	retval = pe_read_exact(file, sections,
+			       (size_t)pi.nsections * sizeof(*sections),
+			       pi.section_table);
+	if (retval)
+		goto out_free;
+
+	dll = kzalloc_obj(*dll, GFP_KERNEL);
+	if (!dll) {
+		retval = -ENOMEM;
+		goto out_free;
+	}
+
+	/* Map the DLL at its preferred base (a dependency is never randomised). */
+	retval = pe_map_image(file, &pi, sections, false, &load_base);
+	if (retval)
+		goto out_free_dll;
+
+	dll->base = load_base;
+	dll->image_size = pi.image_size;
+	dll->entry = pi.entry;
+	dll->img.base = load_base;
+	dll->img.image_size = pi.image_size;
+	dll->reader.read = pe_user_read;
+	dll->reader.ctx = &dll->img;
+	dll->reader.image_size = pi.image_size;
+
+	/*
+	 * Digest the export directory through the mapped-image reader.  The RVAs
+	 * are relative to the image, so the reader adds @load_base for each
+	 * access - which is why this works whether or not the DLL kept its
+	 * preferred base.
+	 */
+	retval = pe_parse_exports(&dll->reader, exp_dd.virtual_address,
+				  exp_dd.size, &dll->exports);
+	if (retval)
+		goto out_unmap;
+
+	kvfree(sections);
+	fput(file);
+	*out = dll;
+	return 0;
+
+out_unmap:
+	vm_munmap(load_base, pi.image_size);
+out_free_dll:
+	kfree(dll);
+out_free:
+	kvfree(sections);
+out_fput:
+	fput(file);
+	return retval;
+}
+
 #endif /* CONFIG_NT_FS_PERSONALITY */
 
 static int load_pe_binary(struct linux_binprm *bprm)
@@ -1019,12 +1424,12 @@ static int load_pe_binary(struct linux_binprm *bprm)
 	struct section_header *sections = NULL;
 	struct pt_regs *regs = current_pt_regs();
 	struct mm_struct *mm;
-	unsigned long reserve, load_base, delta, sp;
+	unsigned long load_base, sp;
 #ifdef CONFIG_NT_FS_PERSONALITY
 	unsigned long teb;
 #endif
 	u32 peaddr;
-	int retval, i;
+	int retval;
 
 	/* The MZ header is already in bprm->buf; find and read the PE header. */
 	retval = -ENOEXEC;
@@ -1107,79 +1512,16 @@ static int load_pe_binary(struct linux_binprm *bprm)
 		goto out_free;
 
 	/*
-	 * Choose where the image goes.
-	 *
-	 * An image that carries base relocations can run anywhere, so when
-	 * address-space randomisation is in effect it is loaded at a
-	 * kernel-chosen base and relocated to it, exactly as a PIE ELF is -
-	 * the preferred base is only a hint.  Otherwise the preferred base is
-	 * tried first with MAP_FIXED_NOREPLACE (which both reserves the whole
-	 * range so a later section mapping cannot collide with an unrelated
-	 * allocation, and reports whether the base is already taken); if it is
-	 * taken, a relocatable image falls back to a kernel-chosen base and a
-	 * non-relocatable one is refused rather than loaded at the wrong
-	 * address.
+	 * Reserve the image range, map the headers and sections, and relocate
+	 * if the image did not land at its preferred base.  An executable that
+	 * carries base relocations is loaded at a kernel-chosen base when
+	 * address-space randomisation is in effect, exactly as a PIE ELF is; the
+	 * shared mapper handles the rest.  On failure it leaves nothing mapped.
 	 */
-	if (!pi.relocs_stripped && pi.reloc_size &&
-	    (current->flags & PF_RANDOMIZE)) {
-		reserve = vm_mmap(NULL, 0, pi.image_size, PROT_NONE,
-				  MAP_PRIVATE | MAP_ANONYMOUS, 0);
-		if (IS_ERR_VALUE(reserve)) {
-			retval = (int)reserve;
-			goto out_free;
-		}
-		load_base = reserve;
-		delta = load_base - pi.image_base;
-	} else {
-		reserve = vm_mmap(NULL, pi.image_base, pi.image_size, PROT_NONE,
-				  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-				  0);
-		if (!IS_ERR_VALUE(reserve) && reserve == pi.image_base) {
-			load_base = pi.image_base;
-			delta = 0;
-		} else {
-			if (!IS_ERR_VALUE(reserve))
-				vm_munmap(reserve, pi.image_size);
-			if (pi.relocs_stripped || !pi.reloc_size) {
-				retval = -ENOMEM;
-				goto out_free;
-			}
-			reserve = vm_mmap(NULL, 0, pi.image_size, PROT_NONE,
-					  MAP_PRIVATE | MAP_ANONYMOUS, 0);
-			if (IS_ERR_VALUE(reserve)) {
-				retval = (int)reserve;
-				goto out_free;
-			}
-			load_base = reserve;
-			delta = load_base - pi.image_base;
-		}
-	}
-
-	/* Map the headers read-only at the load base, as Windows does. */
-	if (pi.header_size) {
-		unsigned long hlen = PAGE_ALIGN(pi.header_size);
-		unsigned long addr = vm_mmap(file, load_base, hlen, PROT_READ,
-					     MAP_PRIVATE | MAP_FIXED, 0);
-
-		if (IS_ERR_VALUE(addr)) {
-			retval = (int)addr;
-			goto out_free;
-		}
-	}
-
-	/* Map each section at its virtual address with its own protection. */
-	for (i = 0; i < pi.nsections; i++) {
-		retval = pe_map_section(file, &sections[i], &pi, load_base);
-		if (retval)
-			goto out_free;
-	}
-
-	/* Fix up the image if it did not land at its preferred base. */
-	if (delta) {
-		retval = pe_apply_relocations(&pi, load_base, delta);
-		if (retval)
-			goto out_free;
-	}
+	retval = pe_map_image(file, &pi, sections,
+			      !!(current->flags & PF_RANDOMIZE), &load_base);
+	if (retval)
+		goto out_free;
 
 	kvfree(sections);
 	sections = NULL;

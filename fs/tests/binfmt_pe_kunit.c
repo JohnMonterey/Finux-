@@ -689,6 +689,149 @@ static void pe_import_malformed_test(struct kunit *test)
 					       pet_import_collect, &log), 0);
 }
 
+/*
+ * ntdll.dll export asset
+ * ----------------------
+ * Phase B ships a real minimal ntdll.dll (a hand-assembled DLL PE whose .text
+ * is one syscall stub per NT service and whose export directory publishes the
+ * seven Nt* names).  This case builds an in-memory image with that exact export
+ * shape and the exact same stub bytes, then drives the Phase-A export parser
+ * over it with the flat reader: every name must resolve to its stub's RVA, the
+ * stub bytes at that RVA must be the "mov r10,rcx; mov eax,<svc>; syscall; ret"
+ * for the right service number, ordinals must resolve too, and a name the DLL
+ * does not export must miss.  That proves the asset and the parse together,
+ * without a running process; the file-based nt_load_dll() path is proven end to
+ * end in phase C.  The layout constants below match the userspace builder in
+ * tools/testing/selftests/binfmt_pe/ntdll_builder.h byte for byte.
+ */
+#define NTDLL_IMAGE_SIZE	0x3000
+#define NTDLL_TEXT_RVA		0x1000	/* .text: the syscall stubs */
+#define NTDLL_STUB_STRIDE	0x10	/* one 16-byte slot per stub */
+#define NTDLL_EDATA_RVA		0x2000	/* .edata: the export directory */
+#define NTDLL_EAT		0x2028	/* u32[7] function RVAs */
+#define NTDLL_ENPT		0x2048	/* u32[7] name RVAs */
+#define NTDLL_ORD		0x2068	/* u16[7] name ordinals */
+#define NTDLL_DLLNAME		0x2080	/* "ntdll.dll" */
+#define NTDLL_NAMES		0x2090	/* packed name strings */
+#define NTDLL_EXP_BASE		1	/* ordinal of the first export */
+
+/*
+ * The exported names, alphabetically sorted (as a real export name table is),
+ * each paired with the NT service number its stub invokes.  The i-th entry's
+ * stub sits at NTDLL_TEXT_RVA + i * NTDLL_STUB_STRIDE.
+ */
+static const struct ntdll_sym {
+	const char *name;
+	u8 svc;
+} ntdll_syms[] = {
+	{ "NtClose",			NT_SYS_NtClose },
+	{ "NtCreateFile",		NT_SYS_NtCreateFile },
+	{ "NtOpenFile",			NT_SYS_NtOpenFile },
+	{ "NtQueryInformationFile",	NT_SYS_NtQueryInformationFile },
+	{ "NtReadFile",			NT_SYS_NtReadFile },
+	{ "NtTerminateProcess",		NT_SYS_NtTerminateProcess },
+	{ "NtWriteFile",		NT_SYS_NtWriteFile },
+};
+
+/*
+ * Lay out the ntdll image into @img and return the export directory's size.
+ * Each stub is "mov r10,rcx; mov eax,<svc>; syscall; ret" (49 89 ca / b8 imm32
+ * / 0f 05 / c3), the same eleven bytes the shipped ntdll.dll carries.
+ */
+static u32 pet_build_ntdll(u8 *img)
+{
+	u32 name_rva = NTDLL_NAMES;
+	unsigned int i;
+
+	memset(img, 0, NTDLL_IMAGE_SIZE);
+
+	/* IMAGE_EXPORT_DIRECTORY at NTDLL_EDATA_RVA. */
+	put_unaligned_le32(NTDLL_DLLNAME, img + NTDLL_EDATA_RVA + 12);	/* Name */
+	put_unaligned_le32(NTDLL_EXP_BASE, img + NTDLL_EDATA_RVA + 16);	/* Base */
+	put_unaligned_le32(ARRAY_SIZE(ntdll_syms), img + NTDLL_EDATA_RVA + 20);
+	put_unaligned_le32(ARRAY_SIZE(ntdll_syms), img + NTDLL_EDATA_RVA + 24);
+	put_unaligned_le32(NTDLL_EAT, img + NTDLL_EDATA_RVA + 28);
+	put_unaligned_le32(NTDLL_ENPT, img + NTDLL_EDATA_RVA + 32);
+	put_unaligned_le32(NTDLL_ORD, img + NTDLL_EDATA_RVA + 36);
+
+	strscpy((char *)(img + NTDLL_DLLNAME), "ntdll.dll",
+		NTDLL_IMAGE_SIZE - NTDLL_DLLNAME);
+
+	for (i = 0; i < ARRAY_SIZE(ntdll_syms); i++) {
+		u32 stub = NTDLL_TEXT_RVA + i * NTDLL_STUB_STRIDE;
+		u8 *code = img + stub;
+
+		code[0] = 0x49;			/* mov r10,rcx */
+		code[1] = 0x89;
+		code[2] = 0xca;
+		code[3] = 0xb8;			/* mov eax,<svc> */
+		put_unaligned_le32(ntdll_syms[i].svc, code + 4);
+		code[8] = 0x0f;			/* syscall */
+		code[9] = 0x05;
+		code[10] = 0xc3;		/* ret */
+
+		put_unaligned_le32(stub, img + NTDLL_EAT + i * sizeof(u32));
+		put_unaligned_le32(name_rva, img + NTDLL_ENPT + i * sizeof(u32));
+		put_unaligned_le16(i, img + NTDLL_ORD + i * sizeof(u16));
+		strscpy((char *)(img + name_rva), ntdll_syms[i].name,
+			NTDLL_IMAGE_SIZE - name_rva);
+		name_rva += strlen(ntdll_syms[i].name) + 1;
+	}
+
+	return name_rva - NTDLL_EDATA_RVA;
+}
+
+static void pe_ntdll_exports_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, NTDLL_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pe_exports exp;
+	u32 dir_size;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	dir_size = pet_build_ntdll(img);
+	pe_flat_image_reader(&r, &flat, img, NTDLL_IMAGE_SIZE);
+
+	KUNIT_ASSERT_EQ(test, pe_parse_exports(&r, NTDLL_EDATA_RVA, dir_size,
+					       &exp), 0);
+	KUNIT_EXPECT_EQ(test, exp.num_names, ARRAY_SIZE(ntdll_syms));
+
+	for (i = 0; i < ARRAY_SIZE(ntdll_syms); i++) {
+		u32 want = NTDLL_TEXT_RVA + i * NTDLL_STUB_STRIDE;
+		const u8 *code = img + want;
+
+		/* Name resolves to the stub RVA... */
+		KUNIT_EXPECT_EQ_MSG(test, pe_export_by_name(&exp, ntdll_syms[i].name),
+				    want, "name %s", ntdll_syms[i].name);
+		/* ...and by ordinal (Base is 1, so ordinal i+1 -> function[i]). */
+		KUNIT_EXPECT_EQ(test,
+				pe_export_by_ordinal(&exp, NTDLL_EXP_BASE + i),
+				want);
+
+		/* The stub at that RVA is the syscall stub for its service. */
+		KUNIT_EXPECT_EQ(test, code[0], 0x49);
+		KUNIT_EXPECT_EQ(test, code[1], 0x89);
+		KUNIT_EXPECT_EQ(test, code[2], 0xca);
+		KUNIT_EXPECT_EQ(test, code[3], 0xb8);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(code + 4),
+				(u32)ntdll_syms[i].svc);
+		KUNIT_EXPECT_EQ(test, code[8], 0x0f);
+		KUNIT_EXPECT_EQ(test, code[9], 0x05);
+		KUNIT_EXPECT_EQ(test, code[10], 0xc3);
+	}
+
+	/* A name the DLL does not export misses. */
+	KUNIT_EXPECT_EQ(test, pe_export_by_name(&exp, "NtNotAThing"), 0);
+	/* An ordinal below Base and one past the last export miss. */
+	KUNIT_EXPECT_EQ(test, pe_export_by_ordinal(&exp, 0), 0);
+	KUNIT_EXPECT_EQ(test,
+			pe_export_by_ordinal(&exp,
+					     NTDLL_EXP_BASE + ARRAY_SIZE(ntdll_syms)),
+			0);
+}
+
 static struct kunit_case binfmt_pe_test_cases[] = {
 	KUNIT_CASE(pe_parse_valid_test),
 	KUNIT_CASE(pe_parse_bad_mz_magic_test),
@@ -714,6 +857,7 @@ static struct kunit_case binfmt_pe_test_cases[] = {
 	KUNIT_CASE(pe_import_enumerate_test),
 	KUNIT_CASE(pe_import_oft_fallback_test),
 	KUNIT_CASE(pe_import_malformed_test),
+	KUNIT_CASE(pe_ntdll_exports_test),
 	{},
 };
 
