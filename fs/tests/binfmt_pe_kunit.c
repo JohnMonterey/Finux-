@@ -343,6 +343,352 @@ static void pe_parse_section_table_overrun_test(struct kunit *test)
 			-ENOEXEC);
 }
 
+/*
+ * Export/import parser tests
+ * --------------------------
+ * The parsers reach a PE image only through a struct pe_image_reader, so these
+ * build a small flat image by hand, wrap it in the flat-buffer reader, and
+ * drive the same code the loader will.  The image is heap-allocated (it is far
+ * larger than the header structs above) and freed with the test.  Layout
+ * constants place the export arrays and the import thunk tables at known RVAs;
+ * fields are written little-endian so the tests do not depend on host byte
+ * order even though the parsers only ever run on x86_64.
+ */
+#define PET_IMAGE_SIZE		0x2000
+
+/* Export directory layout. */
+#define PET_EXP_DIR		0x100
+#define PET_EXP_DIR_SIZE	0x100		/* covers [0x100, 0x200) */
+#define PET_EXP_FWD_STR		0x128		/* forwarder string, in the dir */
+#define PET_EXP_FUNCS		0x200		/* u32[3] function RVAs */
+#define PET_EXP_NAMES		0x220		/* u32[3] name RVAs */
+#define PET_EXP_ORDS		0x240		/* u16[3] name ordinals */
+#define PET_EXP_STR_FOO		0x300
+#define PET_EXP_STR_BAZ		0x310
+#define PET_EXP_STR_FWD		0x320
+#define PET_EXP_FUNC_FOO	0x1000
+#define PET_EXP_FUNC_BAZ	0x1200
+#define PET_EXP_BASE		1
+
+/* Import directory layout. */
+#define PET_IMP_DIR		0x400
+#define PET_IMP_DIR_SIZE	0x40
+#define PET_IMP_DLLNAME		0x480		/* clear of the thunk tables */
+#define PET_IMP_INT		0x500		/* OriginalFirstThunk table */
+#define PET_IMP_IAT		0x520		/* FirstThunk table */
+#define PET_IMP_BYNAME		0x700		/* IMAGE_IMPORT_BY_NAME */
+#define PET_IMP_HINT		0x7
+#define PET_IMP_ORDINAL		0x123
+
+static void pet_write_str(u8 *img, u32 rva, const char *s)
+{
+	strscpy((char *)(img + rva), s, PET_IMAGE_SIZE - rva);
+}
+
+/*
+ * Build an image with three exports: NtFoo (ordinal 1), a forwarder (ordinal
+ * 2, whose function RVA points back into the directory) and NtBaz (ordinal 3).
+ * All three are also named, so the forwarder can be probed by name too.
+ */
+static void pet_build_exports(u8 *img)
+{
+	memset(img, 0, PET_IMAGE_SIZE);
+
+	put_unaligned_le32(PET_EXP_BASE, img + PET_EXP_DIR + 16);
+	put_unaligned_le32(3, img + PET_EXP_DIR + 20);	/* num_functions */
+	put_unaligned_le32(3, img + PET_EXP_DIR + 24);	/* num_names */
+	put_unaligned_le32(PET_EXP_FUNCS, img + PET_EXP_DIR + 28);
+	put_unaligned_le32(PET_EXP_NAMES, img + PET_EXP_DIR + 32);
+	put_unaligned_le32(PET_EXP_ORDS, img + PET_EXP_DIR + 36);
+
+	/* Forwarder target string, deliberately inside the directory region. */
+	pet_write_str(img, PET_EXP_FWD_STR, "OTHER.Bar");
+
+	/* Function RVAs: [0]=Foo, [1]=forwarder, [2]=Baz. */
+	put_unaligned_le32(PET_EXP_FUNC_FOO, img + PET_EXP_FUNCS + 0);
+	put_unaligned_le32(PET_EXP_FWD_STR, img + PET_EXP_FUNCS + 4);
+	put_unaligned_le32(PET_EXP_FUNC_BAZ, img + PET_EXP_FUNCS + 8);
+
+	/* Name RVAs and the names they point at. */
+	put_unaligned_le32(PET_EXP_STR_FOO, img + PET_EXP_NAMES + 0);
+	put_unaligned_le32(PET_EXP_STR_BAZ, img + PET_EXP_NAMES + 4);
+	put_unaligned_le32(PET_EXP_STR_FWD, img + PET_EXP_NAMES + 8);
+	pet_write_str(img, PET_EXP_STR_FOO, "NtFoo");
+	pet_write_str(img, PET_EXP_STR_BAZ, "NtBaz");
+	pet_write_str(img, PET_EXP_STR_FWD, "NtFwd");
+
+	/* name index -> function index. */
+	put_unaligned_le16(0, img + PET_EXP_ORDS + 0);	/* NtFoo -> func[0] */
+	put_unaligned_le16(2, img + PET_EXP_ORDS + 2);	/* NtBaz -> func[2] */
+	put_unaligned_le16(1, img + PET_EXP_ORDS + 4);	/* NtFwd -> func[1] */
+}
+
+/* One import descriptor (ntdll.dll) with a by-name and a by-ordinal thunk. */
+static void pet_build_imports(u8 *img)
+{
+	memset(img, 0, PET_IMAGE_SIZE);
+
+	put_unaligned_le32(PET_IMP_INT, img + PET_IMP_DIR + 0);	/* OFT */
+	put_unaligned_le32(PET_IMP_DLLNAME, img + PET_IMP_DIR + 12); /* Name */
+	put_unaligned_le32(PET_IMP_IAT, img + PET_IMP_DIR + 16);	/* FirstThunk */
+	/* descriptor[1] at PET_IMP_DIR + 20 stays all-zero: the terminator. */
+
+	pet_write_str(img, PET_IMP_DLLNAME, "ntdll.dll");
+
+	/* Import name table: [0] by name, [1] by ordinal, [2] terminator. */
+	put_unaligned_le64(PET_IMP_BYNAME, img + PET_IMP_INT + 0);
+	put_unaligned_le64(IMAGE_ORDINAL_FLAG64 | PET_IMP_ORDINAL,
+			   img + PET_IMP_INT + 8);
+
+	/* IMAGE_IMPORT_BY_NAME { hint, "NtCreateFile" }. */
+	put_unaligned_le16(PET_IMP_HINT, img + PET_IMP_BYNAME + 0);
+	pet_write_str(img, PET_IMP_BYNAME + 2, "NtCreateFile");
+}
+
+struct pet_import_log {
+	int n;
+	struct {
+		char dll[32];
+		char name[32];
+		u32 iat_slot_rva;
+		u16 ordinal;
+		u16 hint;
+		bool by_ordinal;
+	} e[8];
+};
+
+/* Tolerant collector: always counts, only stores while there is room. */
+static int pet_import_collect(void *ctx, const struct pe_import *imp)
+{
+	struct pet_import_log *log = ctx;
+
+	if (log->n < (int)ARRAY_SIZE(log->e)) {
+		strscpy(log->e[log->n].dll, imp->dll,
+			sizeof(log->e[log->n].dll));
+		if (imp->name)
+			strscpy(log->e[log->n].name, imp->name,
+				sizeof(log->e[log->n].name));
+		else
+			log->e[log->n].name[0] = '\0';
+		log->e[log->n].iat_slot_rva = imp->iat_slot_rva;
+		log->e[log->n].ordinal = imp->ordinal;
+		log->e[log->n].hint = imp->hint;
+		log->e[log->n].by_ordinal = imp->by_ordinal;
+	}
+	log->n++;
+	return 0;
+}
+
+static void pe_export_lookup_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pe_exports exp;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	pet_build_exports(img);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+
+	KUNIT_ASSERT_EQ(test, pe_parse_exports(&r, PET_EXP_DIR,
+					       PET_EXP_DIR_SIZE, &exp), 0);
+
+	/* By name: two hits and a miss. */
+	KUNIT_EXPECT_EQ(test, pe_export_by_name(&exp, "NtFoo"), PET_EXP_FUNC_FOO);
+	KUNIT_EXPECT_EQ(test, pe_export_by_name(&exp, "NtBaz"), PET_EXP_FUNC_BAZ);
+	KUNIT_EXPECT_EQ(test, pe_export_by_name(&exp, "NtNope"), 0);
+
+	/* By ordinal: base is 1, so ordinal 1 -> func[0], ordinal 3 -> func[2]. */
+	KUNIT_EXPECT_EQ(test, pe_export_by_ordinal(&exp, 1), PET_EXP_FUNC_FOO);
+	KUNIT_EXPECT_EQ(test, pe_export_by_ordinal(&exp, 3), PET_EXP_FUNC_BAZ);
+
+	/* Out of range: below Base and past the end of the function array. */
+	KUNIT_EXPECT_EQ(test, pe_export_by_ordinal(&exp, 0), 0);
+	KUNIT_EXPECT_EQ(test, pe_export_by_ordinal(&exp, 100), 0);
+}
+
+static void pe_export_forwarder_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pe_exports exp;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	pet_build_exports(img);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+
+	KUNIT_ASSERT_EQ(test, pe_parse_exports(&r, PET_EXP_DIR,
+					       PET_EXP_DIR_SIZE, &exp), 0);
+
+	/*
+	 * The forwarder export (ordinal 2, name "NtFwd") resolves to an RVA
+	 * inside the export directory, so it is reported unresolved by both
+	 * lookups rather than returned as a code address.
+	 */
+	KUNIT_EXPECT_EQ(test, pe_export_by_ordinal(&exp, 2), 0);
+	KUNIT_EXPECT_EQ(test, pe_export_by_name(&exp, "NtFwd"), 0);
+}
+
+static void pe_export_malformed_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pe_exports exp;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	pet_build_exports(img);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+
+	/* No export directory at all. */
+	KUNIT_EXPECT_EQ(test, pe_parse_exports(&r, 0, 0, &exp), -ENOENT);
+
+	/* Directory size smaller than the fixed header. */
+	KUNIT_EXPECT_EQ(test, pe_parse_exports(&r, PET_EXP_DIR, 8, &exp),
+			-ENOEXEC);
+
+	/* NumberOfFunctions past the sanity cap. */
+	put_unaligned_le32(PE_MAX_EXPORTS + 1, img + PET_EXP_DIR + 20);
+	KUNIT_EXPECT_EQ(test, pe_parse_exports(&r, PET_EXP_DIR,
+					       PET_EXP_DIR_SIZE, &exp), -ENOEXEC);
+
+	/* Function array running off the end of the image. */
+	pet_build_exports(img);
+	put_unaligned_le32(PET_IMAGE_SIZE - 4, img + PET_EXP_DIR + 28);
+	KUNIT_EXPECT_EQ(test, pe_parse_exports(&r, PET_EXP_DIR,
+					       PET_EXP_DIR_SIZE, &exp), -ENOEXEC);
+}
+
+static void pe_export_name_off_end_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pe_exports exp;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	pet_build_exports(img);
+
+	/*
+	 * Point a name entry at an unterminated run of bytes at the very end of
+	 * the image.  The comparison must stop at the image edge and report a
+	 * miss instead of reading past it.
+	 */
+	for (i = PET_IMAGE_SIZE - 8; i < PET_IMAGE_SIZE; i++)
+		img[i] = 'A';
+	put_unaligned_le32(PET_IMAGE_SIZE - 8, img + PET_EXP_NAMES + 0);
+
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+	KUNIT_ASSERT_EQ(test, pe_parse_exports(&r, PET_EXP_DIR,
+					       PET_EXP_DIR_SIZE, &exp), 0);
+	KUNIT_EXPECT_EQ(test, pe_export_by_name(&exp, "AAAAAAAAAAAA"), 0);
+}
+
+static void pe_import_enumerate_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pet_import_log log = { };
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	pet_build_imports(img);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+
+	KUNIT_ASSERT_EQ(test, pe_parse_imports(&r, PET_IMP_DIR, PET_IMP_DIR_SIZE,
+					       pet_import_collect, &log), 0);
+	KUNIT_ASSERT_EQ(test, log.n, 2);
+
+	/* Entry 0: import by name, IAT slot at FirstThunk + 0. */
+	KUNIT_EXPECT_STREQ(test, log.e[0].dll, "ntdll.dll");
+	KUNIT_EXPECT_FALSE(test, log.e[0].by_ordinal);
+	KUNIT_EXPECT_STREQ(test, log.e[0].name, "NtCreateFile");
+	KUNIT_EXPECT_EQ(test, log.e[0].hint, PET_IMP_HINT);
+	KUNIT_EXPECT_EQ(test, log.e[0].iat_slot_rva, PET_IMP_IAT + 0);
+
+	/* Entry 1: import by ordinal, IAT slot at FirstThunk + 8. */
+	KUNIT_EXPECT_STREQ(test, log.e[1].dll, "ntdll.dll");
+	KUNIT_EXPECT_TRUE(test, log.e[1].by_ordinal);
+	KUNIT_EXPECT_EQ(test, log.e[1].ordinal, PET_IMP_ORDINAL);
+	KUNIT_EXPECT_EQ(test, log.e[1].iat_slot_rva, PET_IMP_IAT + 8);
+}
+
+static void pe_import_oft_fallback_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pe_flat_image flat;
+	struct pet_import_log log = { };
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	pet_build_imports(img);
+
+	/* Clear OriginalFirstThunk; the lookup must fall back to FirstThunk. */
+	put_unaligned_le32(0, img + PET_IMP_DIR + 0);
+	put_unaligned_le64(PET_IMP_BYNAME, img + PET_IMP_IAT + 0);
+	put_unaligned_le64(IMAGE_ORDINAL_FLAG64 | PET_IMP_ORDINAL,
+			   img + PET_IMP_IAT + 8);
+
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+	KUNIT_ASSERT_EQ(test, pe_parse_imports(&r, PET_IMP_DIR, PET_IMP_DIR_SIZE,
+					       pet_import_collect, &log), 0);
+	KUNIT_ASSERT_EQ(test, log.n, 2);
+	KUNIT_EXPECT_STREQ(test, log.e[0].name, "NtCreateFile");
+	/* IAT slot RVAs are still measured from FirstThunk. */
+	KUNIT_EXPECT_EQ(test, log.e[0].iat_slot_rva, PET_IMP_IAT + 0);
+	KUNIT_EXPECT_EQ(test, log.e[1].iat_slot_rva, PET_IMP_IAT + 8);
+}
+
+static void pe_import_malformed_test(struct kunit *test)
+{
+	u8 *img = kunit_kzalloc(test, PET_IMAGE_SIZE, GFP_KERNEL);
+	struct pe_image_reader r;
+	struct pet_import_log log;
+	struct pe_flat_image flat;
+	u32 rva;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+
+	/* No import directory at all. */
+	pet_build_imports(img);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+	memset(&log, 0, sizeof(log));
+	KUNIT_EXPECT_EQ(test, pe_parse_imports(&r, 0, 0, pet_import_collect,
+					       &log), -ENOENT);
+
+	/* First descriptor only partly inside the image (unterminated array). */
+	memset(&log, 0, sizeof(log));
+	KUNIT_EXPECT_LT(test, pe_parse_imports(&r, PET_IMAGE_SIZE - 8,
+					       PET_IMP_DIR_SIZE,
+					       pet_import_collect, &log), 0);
+
+	/* By-name thunk whose symbol name has no terminator before the end. */
+	pet_build_imports(img);
+	for (rva = PET_IMAGE_SIZE - 4; rva < PET_IMAGE_SIZE; rva++)
+		img[rva] = 'x';
+	/* Name entry: hint occupies the last two readable bytes... */
+	put_unaligned_le64(PET_IMAGE_SIZE - 6, img + PET_IMP_INT + 0);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+	memset(&log, 0, sizeof(log));
+	KUNIT_EXPECT_LT(test, pe_parse_imports(&r, PET_IMP_DIR, PET_IMP_DIR_SIZE,
+					       pet_import_collect, &log), 0);
+
+	/* Unterminated thunk table: nonzero thunks all the way to the end. */
+	memset(img, 0, PET_IMAGE_SIZE);
+	put_unaligned_le32(PET_IMP_INT, img + PET_IMP_DIR + 0);
+	put_unaligned_le32(PET_IMP_DLLNAME, img + PET_IMP_DIR + 12);
+	put_unaligned_le32(PET_IMP_IAT, img + PET_IMP_DIR + 16);
+	pet_write_str(img, PET_IMP_DLLNAME, "ntdll.dll");
+	for (rva = PET_IMP_INT; rva + 8 <= PET_IMAGE_SIZE; rva += 8)
+		put_unaligned_le64(IMAGE_ORDINAL_FLAG64 | 1, img + rva);
+	pe_flat_image_reader(&r, &flat, img, PET_IMAGE_SIZE);
+	memset(&log, 0, sizeof(log));
+	KUNIT_EXPECT_LT(test, pe_parse_imports(&r, PET_IMP_DIR, PET_IMP_DIR_SIZE,
+					       pet_import_collect, &log), 0);
+}
+
 static struct kunit_case binfmt_pe_test_cases[] = {
 	KUNIT_CASE(pe_parse_valid_test),
 	KUNIT_CASE(pe_parse_bad_mz_magic_test),
@@ -361,6 +707,13 @@ static struct kunit_case binfmt_pe_test_cases[] = {
 	KUNIT_CASE(pe_parse_bad_entry_test),
 	KUNIT_CASE(pe_parse_header_too_big_test),
 	KUNIT_CASE(pe_parse_section_table_overrun_test),
+	KUNIT_CASE(pe_export_lookup_test),
+	KUNIT_CASE(pe_export_forwarder_test),
+	KUNIT_CASE(pe_export_malformed_test),
+	KUNIT_CASE(pe_export_name_off_end_test),
+	KUNIT_CASE(pe_import_enumerate_test),
+	KUNIT_CASE(pe_import_oft_fallback_test),
+	KUNIT_CASE(pe_import_malformed_test),
 	{},
 };
 

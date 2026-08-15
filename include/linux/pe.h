@@ -390,6 +390,57 @@ struct section_header {
 	uint32_t flags;
 };
 
+/*
+ * Export directory (data directory 0, .edata).  IMAGE_EXPORT_DIRECTORY: the
+ * table a DLL publishes so others can resolve its symbols.  The name and
+ * name-ordinal arrays are parallel and sorted by name; name_ordinals[i] is a
+ * zero-based index into the function array for names[i].  An export whose
+ * function RVA points back inside the export directory is not code but a
+ * forwarder string ("OTHER.dll.Symbol").
+ */
+struct pe_export_directory {
+	uint32_t flags;			/* Characteristics, reserved (0) */
+	uint32_t timestamp;		/* TimeDateStamp */
+	uint16_t major_version;
+	uint16_t minor_version;
+	uint32_t name;			/* RVA of the DLL's own name */
+	uint32_t base;			/* ordinal of the first export */
+	uint32_t num_functions;		/* entries in the function array */
+	uint32_t num_names;		/* entries in the name/ordinal arrays */
+	uint32_t functions;		/* RVA of the u32 function-RVA array */
+	uint32_t names;			/* RVA of the u32 name-RVA array */
+	uint32_t name_ordinals;		/* RVA of the u16 name-ordinal array */
+};
+
+/*
+ * Import directory (data directory 1, .idata).  IMAGE_IMPORT_DESCRIPTOR: one
+ * per imported DLL, the array terminated by an all-zero entry.  lookup_table
+ * (OriginalFirstThunk) and address_table (FirstThunk) point at parallel arrays
+ * of 64-bit thunks; the loader walks the lookup table to learn what to import
+ * and patches each resolved address into the matching slot of the address
+ * table (the IAT).  A file whose lookup_table is 0 uses the address table for
+ * both.
+ */
+struct pe_import_descriptor {
+	uint32_t lookup_table;		/* OriginalFirstThunk: import name tbl */
+	uint32_t timestamp;		/* TimeDateStamp */
+	uint32_t forwarder_chain;	/* ForwarderChain */
+	uint32_t name;			/* RVA of the imported DLL's name */
+	uint32_t address_table;		/* FirstThunk: import address table */
+};
+
+/*
+ * An entry in an import lookup/address table names its symbol by ordinal when
+ * IMAGE_ORDINAL_FLAG64 (bit 63) is set - the ordinal is the low 16 bits -
+ * otherwise the low 31 bits are the RVA of an IMAGE_IMPORT_BY_NAME.
+ */
+#define IMAGE_ORDINAL_FLAG64	0x8000000000000000ULL
+
+struct pe_import_by_name {
+	uint16_t hint;			/* index hint into the DLL's export names */
+	char name[];			/* NUL-terminated symbol name */
+};
+
 enum x64_coff_reloc_type {
 	IMAGE_REL_AMD64_ABSOLUTE = 0,
 	IMAGE_REL_AMD64_ADDR64,

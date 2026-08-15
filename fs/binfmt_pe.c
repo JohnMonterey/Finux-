@@ -55,6 +55,7 @@
 #include <linux/sched/task_stack.h>
 #include <linux/slab.h>
 #include <linux/log2.h>
+#include <linux/string.h>
 #include <linux/pe.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
@@ -269,6 +270,396 @@ static int pe_parse_headers(const void *mz, size_t mz_len,
 	out->reloc_rva = 0;
 	out->reloc_size = 0;
 	return 0;
+}
+
+/*
+ * ===========================================================================
+ * PE dynamic-linking parsers
+ * ===========================================================================
+ *
+ * Everything from here to the end of this banner turns the export and import
+ * data directories of a PE image into something an in-kernel dynamic linker
+ * can act on.  Like pe_parse_headers() above it is pure PE-format logic: it
+ * does no I/O and touches no task state, reaching the image only through a
+ * struct pe_image_reader.  That keeps it unit-testable against a flat buffer
+ * and lets the loader later drive the same code over a mapped image with a
+ * copy_from_user-backed reader, without a line of this changing.
+ *
+ * Every access to the image goes through pe_reader_read(), which bounds-checks
+ * the RVA and length against the image size before the backing reader ever
+ * runs.  A malformed directory can therefore misdescribe the image, but can
+ * never make the parser read outside it.
+ */
+
+/*
+ * Sanity caps on the tables below.  These are not format limits - PE permits
+ * more - but bounds that keep a hostile or corrupt directory from making the
+ * parser iterate or copy without limit.  They sit far above anything a real
+ * image needs (ntdll exports ~2500 symbols; nothing imports from thousands of
+ * DLLs).
+ */
+#define PE_MAX_EXPORTS		(64 * 1024)	/* export ordinals are 16-bit */
+#define PE_MAX_IMPORT_DLLS	4096		/* import descriptors */
+#define PE_MAX_IMPORTS_PER_DLL	(64 * 1024)	/* thunks in one descriptor */
+#define PE_MAX_SYM_NAME		1024		/* symbol-name comparison cap */
+#define PE_MAX_DLL_NAME		256		/* imported DLL name cap */
+
+/*
+ * An abstract, bounds-checked view of a PE image addressed by RVA.  @read
+ * copies @len bytes at @rva into @buf and returns 0 or a negative errno; it
+ * may assume [@rva, @rva+@len) already lies within @image_size, because
+ * pe_reader_read() checks that before calling it.  The flat-buffer reader
+ * below backs the unit tests; the loader supplies a copy_from_user-backed one.
+ */
+struct pe_image_reader {
+	int (*read)(void *ctx, u32 rva, void *buf, u32 len);
+	void *ctx;
+	u32 image_size;		/* RVAs must satisfy rva + len <= image_size */
+};
+
+/*
+ * The single choke point for every image access.  Rejects a length larger
+ * than the image and any [rva, rva+len) that would run past the end, with the
+ * subtraction ordered so it can never wrap, then defers to the backing reader.
+ */
+static int pe_reader_read(const struct pe_image_reader *r, u32 rva,
+			  void *buf, u32 len)
+{
+	if (len > r->image_size || rva > r->image_size - len)
+		return -EFAULT;
+	return r->read(r->ctx, rva, buf, len);
+}
+
+/* A pe_image_reader backed by a flat in-memory buffer, used by the tests. */
+struct pe_flat_image {
+	const void *base;
+	u32 size;
+};
+
+static int pe_flat_read(void *ctx, u32 rva, void *buf, u32 len)
+{
+	const struct pe_flat_image *img = ctx;
+
+	/* pe_reader_read() has already bounded rva/len against image_size. */
+	memcpy(buf, (const u8 *)img->base + rva, len);
+	return 0;
+}
+
+static void __maybe_unused pe_flat_image_reader(struct pe_image_reader *r,
+						struct pe_flat_image *img,
+						const void *base, u32 size)
+{
+	img->base = base;
+	img->size = size;
+	r->read = pe_flat_read;
+	r->ctx = img;
+	r->image_size = size;
+}
+
+/*
+ * Copy a NUL-terminated string from @rva into @buf (always NUL-terminated),
+ * reading one byte at a time so a string that runs off the end of the image is
+ * refused by pe_reader_read() rather than read past it.  Returns 0 on success,
+ * -ENAMETOOLONG if no terminator appears within @bufsz, or the reader's error.
+ */
+static int pe_read_cstr(const struct pe_image_reader *r, u32 rva,
+			char *buf, u32 bufsz)
+{
+	u32 i;
+
+	if (!bufsz)
+		return -EINVAL;
+
+	for (i = 0; i < bufsz; i++) {
+		char c;
+		int err = pe_reader_read(r, rva + i, &c, 1);
+
+		if (err)
+			return err;
+		buf[i] = c;
+		if (!c)
+			return 0;
+	}
+	buf[bufsz - 1] = '\0';
+	return -ENAMETOOLONG;
+}
+
+/*
+ * Compare the NUL-terminated string at @rva against @want, at most @cap bytes.
+ * Any read that would leave the image, or a string longer than @cap, counts as
+ * "not equal" - a safe miss, never an out-of-bounds read.  (The first byte's
+ * read validates @rva, so @rva + @i below cannot wrap for the bytes that
+ * follow.)
+ */
+static bool pe_streq_at(const struct pe_image_reader *r, u32 rva,
+			const char *want, u32 cap)
+{
+	u32 i;
+
+	for (i = 0; i < cap; i++) {
+		char c;
+
+		if (pe_reader_read(r, rva + i, &c, 1))
+			return false;
+		if (c != want[i])
+			return false;
+		if (!c)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The digested export directory: the reader plus the array locations and
+ * counts the lookups need.  dir_rva/dir_size bound the directory itself and are
+ * kept so a resolved RVA that lands back inside it can be recognised as a
+ * forwarder.
+ */
+struct pe_exports {
+	const struct pe_image_reader *reader;
+	u32 dir_rva;
+	u32 dir_size;
+	u32 base;
+	u32 num_functions;
+	u32 num_names;
+	u32 functions;		/* RVA of the u32 function-RVA array */
+	u32 names;		/* RVA of the u32 name-RVA array */
+	u32 name_ordinals;	/* RVA of the u16 name-ordinal array */
+};
+
+/*
+ * Digest the export directory at [@dir_rva, @dir_rva+@dir_size) into @out.
+ * Validates the fixed directory header and that each of the three parallel
+ * arrays lies wholly within the image (the per-entry reads in the lookups are
+ * bounds-checked again by the reader).  Returns 0, -ENOENT if the image has no
+ * export directory, or -ENOEXEC if the directory is malformed.
+ */
+static int __maybe_unused pe_parse_exports(const struct pe_image_reader *reader,
+					   u32 dir_rva, u32 dir_size,
+					   struct pe_exports *out)
+{
+	struct pe_export_directory dir;
+	int err;
+
+	if (!dir_rva || !dir_size)
+		return -ENOENT;
+	if (dir_size < sizeof(dir))
+		return -ENOEXEC;
+
+	err = pe_reader_read(reader, dir_rva, &dir, sizeof(dir));
+	if (err)
+		return err;
+
+	if (dir.num_functions > PE_MAX_EXPORTS || dir.num_names > PE_MAX_EXPORTS)
+		return -ENOEXEC;
+
+	/* Each parallel array must fit inside the image (computed in u64). */
+	if ((u64)dir.functions + (u64)dir.num_functions * sizeof(u32) >
+	    reader->image_size)
+		return -ENOEXEC;
+	if ((u64)dir.names + (u64)dir.num_names * sizeof(u32) >
+	    reader->image_size)
+		return -ENOEXEC;
+	if ((u64)dir.name_ordinals + (u64)dir.num_names * sizeof(u16) >
+	    reader->image_size)
+		return -ENOEXEC;
+
+	out->reader = reader;
+	out->dir_rva = dir_rva;
+	out->dir_size = dir_size;
+	out->base = dir.base;
+	out->num_functions = dir.num_functions;
+	out->num_names = dir.num_names;
+	out->functions = dir.functions;
+	out->names = dir.names;
+	out->name_ordinals = dir.name_ordinals;
+	return 0;
+}
+
+/*
+ * Map a zero-based index into the function-RVA array to its target RVA,
+ * applying the "not resolvable here" rules: an out-of-range index or an empty
+ * (zero) slot yields 0, and a target that lands inside the export directory is
+ * a forwarder string ("OTHER.dll.Symbol"), which this loader does not chase -
+ * it is reported as unresolved (0) too, for phase B to handle separately.
+ */
+static u32 pe_export_function_rva(const struct pe_exports *e, u32 index)
+{
+	u32 rva;
+
+	if (index >= e->num_functions)
+		return 0;
+	if (pe_reader_read(e->reader, e->functions + index * sizeof(u32),
+			   &rva, sizeof(rva)))
+		return 0;
+	if (!rva)
+		return 0;
+	/* Forwarder: an RVA within the export directory is a string, not code. */
+	if (rva >= e->dir_rva && (u64)rva < (u64)e->dir_rva + e->dir_size)
+		return 0;
+	return rva;
+}
+
+/*
+ * Resolve an export by name to its RVA, or 0 if the DLL does not export that
+ * name (or exports it only as a forwarder).  Walks the name array comparing
+ * each name string, then maps the matching slot through the name-ordinal array
+ * to a function index.  Linear search; the name comparison length is capped.
+ */
+static u32 __maybe_unused pe_export_by_name(const struct pe_exports *e,
+					    const char *name)
+{
+	u32 i;
+
+	for (i = 0; i < e->num_names; i++) {
+		u32 name_rva;
+		u16 index;
+
+		if (pe_reader_read(e->reader, e->names + i * sizeof(u32),
+				   &name_rva, sizeof(name_rva)))
+			return 0;
+		if (!pe_streq_at(e->reader, name_rva, name, PE_MAX_SYM_NAME))
+			continue;
+		if (pe_reader_read(e->reader, e->name_ordinals + i * sizeof(u16),
+				   &index, sizeof(index)))
+			return 0;
+		return pe_export_function_rva(e, index);
+	}
+	return 0;
+}
+
+/*
+ * Resolve an export by ordinal to its RVA, or 0 if the ordinal is out of range
+ * or names a forwarder.  The ordinal is biased by the directory's Base to give
+ * a zero-based index into the function-RVA array.
+ */
+static u32 __maybe_unused pe_export_by_ordinal(const struct pe_exports *e,
+					       u16 ordinal)
+{
+	if (ordinal < e->base)
+		return 0;
+	return pe_export_function_rva(e, ordinal - e->base);
+}
+
+/*
+ * One import, handed to the pe_parse_imports() callback.  @dll and @name point
+ * at buffers valid only for the duration of the call; a callback that needs to
+ * keep them must copy.  @iat_slot_rva is FirstThunk + i*8 - the IAT slot the
+ * binder will later overwrite with the resolved address.  For an import by
+ * ordinal @by_ordinal is true and @ordinal holds it; otherwise @hint and @name
+ * describe the import by name.
+ */
+struct pe_import {
+	const char *dll;
+	const char *name;	/* NULL when by_ordinal */
+	u32 iat_slot_rva;
+	u16 ordinal;		/* valid when by_ordinal */
+	u16 hint;		/* valid when !by_ordinal */
+	bool by_ordinal;
+};
+
+/*
+ * Callback invoked once per imported symbol.  Returns 0 to continue; a nonzero
+ * return stops the walk and becomes pe_parse_imports()'s return value, letting
+ * a binder abort on the first symbol it cannot resolve.
+ */
+typedef int (*pe_import_cb)(void *ctx, const struct pe_import *imp);
+
+/*
+ * Walk the import directory, invoking @cb once per imported symbol.
+ *
+ * The descriptor array at @dir_rva runs until an all-zero terminator (or the
+ * PE_MAX_IMPORT_DLLS cap).  For each descriptor the lookup table
+ * (OriginalFirstThunk, or FirstThunk when it is zero) is walked until a zero
+ * thunk: bit 63 marks an import by ordinal (low 16 bits), otherwise the low 31
+ * bits are the RVA of an IMAGE_IMPORT_BY_NAME { hint, name }.  The IAT slot the
+ * binder will patch is always FirstThunk + i*8, reported regardless of which
+ * table was read.  Returns 0 when every descriptor is consumed, a nonzero
+ * callback return, -ENOENT if the image has no import directory, or
+ * -ENOEXEC/-EFAULT on a malformed or out-of-range directory.
+ */
+static int __maybe_unused pe_parse_imports(const struct pe_image_reader *reader,
+					   u32 dir_rva, u32 dir_size,
+					   pe_import_cb cb, void *ctx)
+{
+	char dll[PE_MAX_DLL_NAME];
+	u32 d;
+
+	if (!dir_rva || !dir_size)
+		return -ENOENT;
+
+	for (d = 0; d < PE_MAX_IMPORT_DLLS; d++) {
+		struct pe_import_descriptor desc;
+		u32 lookup, i;
+		int err;
+
+		err = pe_reader_read(reader, dir_rva + d * sizeof(desc),
+				     &desc, sizeof(desc));
+		if (err)
+			return err;
+
+		/* An all-zero descriptor terminates the array. */
+		if (!desc.lookup_table && !desc.timestamp &&
+		    !desc.forwarder_chain && !desc.name && !desc.address_table)
+			return 0;
+
+		/* A real descriptor must name its DLL and have an IAT. */
+		if (!desc.name || !desc.address_table)
+			return -ENOEXEC;
+
+		err = pe_read_cstr(reader, desc.name, dll, sizeof(dll));
+		if (err)
+			return err;
+
+		/* OriginalFirstThunk is the lookup table; fall back to the IAT. */
+		lookup = desc.lookup_table ? desc.lookup_table :
+					     desc.address_table;
+
+		for (i = 0; i < PE_MAX_IMPORTS_PER_DLL; i++) {
+			struct pe_import imp = { .dll = dll };
+			char name[PE_MAX_SYM_NAME];
+			u64 thunk;
+
+			err = pe_reader_read(reader, lookup + i * sizeof(u64),
+					     &thunk, sizeof(thunk));
+			if (err)
+				return err;
+			if (!thunk)
+				break;		/* end of this DLL's imports */
+
+			/* IAT slot the binder patches: FirstThunk + i*8. */
+			if ((u64)desc.address_table + (u64)i * sizeof(u64) +
+			    sizeof(u64) > reader->image_size)
+				return -ENOEXEC;
+			imp.iat_slot_rva = desc.address_table + i * sizeof(u64);
+
+			if (thunk & IMAGE_ORDINAL_FLAG64) {
+				imp.by_ordinal = true;
+				imp.ordinal = thunk & 0xffff;
+			} else {
+				u32 name_rva = thunk & 0x7fffffff;
+				u16 hint;
+
+				err = pe_reader_read(reader, name_rva,
+						     &hint, sizeof(hint));
+				if (err)
+					return err;
+				err = pe_read_cstr(reader, name_rva + sizeof(hint),
+						   name, sizeof(name));
+				if (err)
+					return err;
+				imp.hint = hint;
+				imp.name = name;
+			}
+
+			err = cb(ctx, &imp);
+			if (err)
+				return err;
+		}
+		if (i == PE_MAX_IMPORTS_PER_DLL)
+			return -ENOEXEC;	/* unterminated thunk table */
+	}
+	return -ENOEXEC;			/* unterminated descriptor array */
 }
 
 /* Read exactly @len bytes from @file at @pos, or fail. */
